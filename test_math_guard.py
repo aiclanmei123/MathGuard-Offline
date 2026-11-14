@@ -546,6 +546,55 @@ def main() -> int:
         if not ok:
             fails.append(f"{desc}: 预期 {want}，实际 {d.status}")
 
+    print("\n[84 篇大规模 arXiv 测试暴露的缺陷]")
+    BS6 = "\\"
+    big_cases = [
+        # 两个本来正确的式子曾因浮点/括号误判为错
+        ("分数等于小数", "1/200=0.005", "ok"),
+        ("百分比", "26/500=5.2" + BS6 + "%", "ok"),
+        ("括号幂表达式", "5(5^{2}-1)=120", "ok"),
+        # 各种「关系符不构成数值断言」的记号
+        ("远大于", "n >> 0", "parsed"),
+        ("商集", "T(H)/{" + BS6 + "sim}", "parsed"),
+        ("循环小数", "3122=" + BS6 + "overline{1322}", "parsed"),
+        ("概率记号", BS6 + "pr{" + BS6 + "mathcal R=1}=0", "parsed"),
+        ("自定义宏", BS6 + "lt B", "skip"),
+        ("以 sim 结尾", "X_1, " + BS6 + "dots, X_n " + BS6 + "sim", "skip"),
+    ]
+    for desc, latex, want in big_cases:
+        d = m.verify_with_sympy(m.MathItem(kind="inline", line=1, latex=latex, original=latex))
+        ok = d.status == want
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:16} 预期={want} 实际={d.status}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {want}，实际 {d.status}")
+
+    # TikZ 图形标签不应被当作数学断言
+    tikz_tex = (
+        "\\documentclass{article}\n\\usepackage{tikz}\n\\begin{document}\n"
+        "\\begin{tikzpicture}\n"
+        "  \\node (v0) at (0,0) {$v_0$};\n"
+        "  \\node[anchor=east] at ([xshift=-5pt]v0.west) {$w =$};\n"
+        "\\end{tikzpicture}\n"
+        "\\end{document}\n"
+    )
+    tmpt = os.path.join(tempfile.gettempdir(), "_mg_tikz_test.tex")
+    open(tmpt, "w", encoding="utf-8").write(tikz_tex)
+    dt = m.read_tex(tmpt)
+    dts = [m.verify_with_sympy(it) for it in m.gather_math_items(dt)]
+    badt = [x for x in dts if x.status == "error"]
+    ok = len(badt) == 0
+    passed += ok
+    failed += not ok
+    print(f"  {'PASS' if ok else 'FAIL'}  {'TikZ 标签不误报':16} 预期=0 实际={len(badt)}")
+    if not ok:
+        fails.append(f"TikZ 标签: {len(badt)} 个被误判")
+    try:
+        os.remove(tmpt)
+    except OSError:
+        pass
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 

@@ -688,6 +688,63 @@ _DERIV_NOTATION_RE = re.compile(
 # 3) 上下文中出现"取模 p^k / mod"时，普通等号可能是模意义下的近似写法。
 #    实测原文 "(70^3)/125=2744/5 ... 取模 1331" 被误判为 2744 = 2744/5。
 _MODULO_HINT_RE = re.compile(r"(?:取模|模\s*\$?|\bpmod\b|\bmod\b|modulo|\\pmod)")
+
+# 4) 「远大于 / 远小于」：n >> 0、x \ll 1
+#    `>>` 在 sanitize 里会变成 `> >`，被 _REL_RE 切成两段单 >，中间是空操作数。
+#    实测（arXiv:2611.16680）：n >> 0、\lvert i\rvert >> 0 被判缺操作数。
+_ASYM_RE = re.compile(r">\s*>>|<\s*<<|\\gg|\\ll|>>|<<")
+
+# 5) 商集 / 循环小数 / 概率记号 —— 都是「关系符不构成数值断言」的写法
+#    T(H)/{\sim}         商集（等价类）
+#    3122=\overline{1322}  循环小数（上划线表示循环节）
+#    \pr{\mathcal R=1}=0   概率记号（内部等号不是外层断言）
+_QUOTIENT_RE = re.compile(r"/\s*\{?\s*\\sim\s*\}?")
+_OVERLINE_NUM_RE = re.compile(r"\\overline\s*\{\s*\d+\s*\}")
+_PROB_OP_RE = re.compile(r"\\(?:pr|Pr|mathbb\{P\}|operatorname\*?\{Pr\})")
+
+
+def _build_known_cmds() -> frozenset:
+    """已知的 LaTeX 数学命令集合（内建宏库 + 常用结构命令）。
+
+    用途：判断一个 \\cmd 是不是「未定义的自定义宏」。
+    若是，工具无法知道它的数学含义，只能归到「无法验证」，
+    绝不能因为它开头就认定成关系符而判笔误。
+    """
+    names = set()
+    if _MACROS is not None:
+        for attr in ("OPERATORS", "GREEK", "FUNCTIONS", "FONT_WRAPPERS",
+                     "DISCARD", "ARG_DISCARD", "SPECIAL", "COMPLEX"):
+            d = getattr(_MACROS, attr, None)
+            if isinstance(d, dict):
+                names |= set(d.keys())
+            elif isinstance(d, (set, frozenset, list, tuple)):
+                names |= set(d)
+    names |= {
+        "frac", "dfrac", "tfrac", "cfrac", "sqrt", "binom", "dbinom", "tbinom",
+        "left", "right", "bigl", "bigr", "Bigl", "Bigr", "biggl", "biggr",
+        "begin", "end", "label", "ref", "eqref", "tag", "notag", "nonumber",
+        "text", "textbf", "textit", "textrm", "mbox", "operatorname",
+        "mathbb", "mathcal", "mathbf", "mathit", "mathrm", "mathsf", "mathtt",
+        "mathfrak", "mathscr", "boldsymbol", "bm", "hat", "widehat", "bar",
+        "overline", "underline", "vec", "dot", "ddot", "tilde", "widetilde",
+        "overset", "underset", "stackrel", "sum", "prod", "int", "oint",
+        "lim", "infty", "partial", "nabla", "to", "mapsto", "sim", "approx",
+        "quad", "qquad", "displaystyle", "textstyle", "scriptstyle",
+        "cdots", "ldots", "dots", "vdots", "ddots", "prime", "circ",
+        "pm", "mp", "times", "div", "cdot", "ast", "star", "dagger",
+        "leq", "geq", "neq", "equiv", "ll", "gg", "prec", "succ",
+        "in", "notin", "subset", "supset", "cup", "cap", "setminus",
+        "forall", "exists", "neg", "land", "lor", "implies", "iff",
+        "la", "ra", "langle", "rangle", "lfloor", "rfloor", "lceil", "rceil",
+        "lvert", "rvert", "lVert", "rVert", "vert", "Vert",
+        "exp", "ln", "log", "sin", "cos", "tan", "max", "min", "sup", "inf",
+        "det", "dim", "ker", "arg", "gcd", "mod", "bmod", "pmod", "pr",
+        "Pr", "lbrace", "rbrace", "backslash", "colon",
+    }
+    return frozenset(names)
+
+
+_KNOWN_CMDS: frozenset = frozenset()
 _DISPLAY_RE = re.compile(r"\\\[(.*?)\\\]", re.S)
 _MATH_ENV_RE = re.compile(
     r"\\begin\s*\{(equation|align|gather|multline|eqnarray)(\*?)\}(.*?)\\end\s*\{\1\2\}", re.S
@@ -1707,12 +1764,26 @@ def gather_math_items(doc: TexDocument) -> List[MathItem]:
     def in_heading(pos: int) -> bool:
         return any(a <= pos < b for a, b in _hspans)
 
+    # TikZ 绘图命令里的 $...$ 是**图形标签**（\node ... {$w =$}），
+    # 不是数学断言。先算出所有 tikzpicture 环境的区间。
+    _TIKZ_SPANS: List[Tuple[int, int]] = [
+        (m_.start(), m_.end())
+        for m_ in re.finditer(
+            r"\\begin\s*\{tikzpicture\}.*?\\end\s*\{tikzpicture\}", text, re.S)
+    ]
+
+    def in_tikz(pos: int) -> bool:
+        return any(a <= pos < b for a, b in _TIKZ_SPANS)
+
     def add(kind: str, start: int, body: str, env: str = "") -> None:
         line, _ = doc.locate(start)
         expanded = expand_macros(body, macros) if macros else body
         # 标题里的公式标记为 heading 类型，验证时只做解析、不做数值断言
         if in_heading(start):
             kind = "heading"
+        # TikZ 图形标签：$w =$、$a$ 这类是画图标注，不做数值断言
+        elif in_tikz(start):
+            kind = "tikzlabel"
         # 跨块模运算上下文：形如 "…=2744/5 、 … 取模 1331"，
         # 「取模」这两个字落在相邻的文本里（不在同一个 $...$ 内）。
         # 这种写法在数论论文里很常见，按普通等式判定必然假阳性，
@@ -2062,8 +2133,15 @@ def _restore_length(sanitized: str) -> str:
     #   注意：末尾的负向断言**不能禁空格**——花括号闭合处本来就会留下空格；
     #   只禁数字和小数点即可，避免把 "2^{2}-1" 里的 "-1" 吃进指数。
     #   实证（arXiv:2611.16254）：$2^{4-1}=8$ 曾被误判成 15=8。
+    #   ⚠ 关键区分（花括号抹成空格后）：
+    #        指数是表达式  2^{4-1}  -> '2^ 4-1 =8'   ← ^ 后有空格，空格在**后**
+    #        指数是单数字  2^{2}-1  -> '2^ 2 -1=3'   ← ^ 后有空格，空格在**前**
+    #     因此：**^ 与数字之间必须隔一个空格**（即花括号刚从那里闭合），
+    #     且表达式内部不能再有空格。这样 5(5^2-1) 里的 '5^ 2 -1' 不会被误吞。
+    #     实测（arXiv:2611.16079）：5(5^2-1)=120 曾被判 25=120。
+    #     实测（arXiv:2611.16254）：2^{4-1}=8 曾被判 15=8。
     _pow_expr = re.compile(
-        r"([A-Za-z0-9)])\s*\^\s*(\d+(?:[+\-*/]\d+)+)(?![0-9.])")
+        r"([A-Za-z0-9)])\^\s+(\d+(?:[+\-*/]\d+)+)(?![0-9.])")
 
     def _sub_pow_expr(m: "re.Match[str]") -> str:
         base, expr = m.group(1), m.group(2)
@@ -2236,9 +2314,28 @@ def _split_relations(expr: str) -> Tuple[List[str], List[str]]:
 
 def _check_pure_numeric(item: MathItem, parts: List[str], ops: List[str]) -> CheckDetail:
     """对「纯数字公式」直接做字面比较（不经 sympy，几万位的整数也很快）。"""
+    # ⚠ 百分比：`5.2\%` 在 sanitize 阶段会丢掉 `%`，只剩 `5.2`，
+    #   于是 26/500 = 5.2 被判不成立（实际是 5.2%）。
+    #   这里从**原文**判断右侧是否带百分号，是则把左侧也按百分比换算。
+    #   实证（arXiv:2611.16278）：26/500=5.2\%、12/500=2.4\% 都被误报。
+    raw = item.latex
+    pct_tail = re.search(r"\\?%\s*$", raw) is not None
+
     def lit(piece: str) -> Optional[Any]:
         text = _insert_implicit_mul(re.sub(r"\s+", "", piece)).replace("^", "**")
-        return _safe_eval_num(text)
+        scale = 1
+        if text.endswith("‰"):
+            text = text[:-1]
+            scale = 1000
+        val = _safe_eval_num(text)
+        if val is None:
+            return None
+        if scale != 1:
+            try:
+                return Fraction(val) / scale if isinstance(val, Fraction) else val / scale
+            except Exception:
+                return None
+        return val
 
     for idx, op in enumerate(ops):
         if op not in _ASSERTABLE_OPS:
@@ -2252,9 +2349,37 @@ def _check_pure_numeric(item: MathItem, parts: List[str], ops: List[str]) -> Che
         lv, rv = lit(parts[idx]), lit(parts[idx + 1])
         if lv is None or rv is None:
             continue
+        # 原文以 % 结尾时，右边是「百分比数值」，左边要除以 100 才能比
+        if pct_tail and idx + 1 == len(parts) - 1:
+            try:
+                base = rv / 100
+                lv_cmp, rv_cmp = lv, base
+            except Exception:
+                lv_cmp, rv_cmp = lv, rv
+        else:
+            lv_cmp, rv_cmp = lv, rv
+        # ⚠ 数值比较必须容忍浮点误差：
+        #   _safe_eval_num 对 `1/200` 返回 Fraction(1,200)，
+        #   而 Fraction(1,200) == 0.005 在 Python 里是 **False**（浮点表示不精确），
+        #   导致正确的 `1/200=0.005`、`26/500=5.2\%` 被判"不成立"。
+        #   实证（arXiv:2611.16614、2611.16278）：这两类都被误报。
+        #   处理：先尽量比较精确值；若不相等再按相对误差 1e-9 判等。
+        def _close(a: Any, b: Any) -> bool:
+            try:
+                if a == b:
+                    return True
+                fa, fb = float(a), float(b)
+                if fa == fb:
+                    return True
+                scale = max(abs(fa), abs(fb), 1e-30)
+                return abs(fa - fb) <= 1e-9 * scale
+            except Exception:
+                return False
+
         try:
-            ok = {"=": lv == rv, "==": lv == rv, "<=": lv <= rv,
-                  ">=": lv >= rv, "!=": lv != rv}[op]
+            ok = {"=": _close(lv_cmp, rv_cmp), "==": _close(lv_cmp, rv_cmp),
+                  "<=": lv_cmp <= rv_cmp, ">=": lv_cmp >= rv_cmp,
+                  "!=": not _close(lv_cmp, rv_cmp)}[op]
         except Exception:
             continue
         if ok is False:
@@ -2325,6 +2450,10 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
             return CheckDetail(latex=item.latex, status="skip",
                                reason="嵌在中文句中的符号代用（如 $=$、$\\ge5$），非完整公式",
                                line=item.line, kind=item.kind, relations=len(ops))
+        if item.kind == "tikzlabel":
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="TikZ 图形里的标签（\\node/\\draw 内），非数学断言",
+                               line=item.line, kind=item.kind, relations=len(ops))
         if _LEGENDRE_RE.search(item.latex):
             return CheckDetail(latex=item.latex, status="parsed",
                                reason="勒让德/雅可比符号记号（a/p），不是除法等式",
@@ -2337,6 +2466,26 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
                 return CheckDetail(latex=item.latex, status="parsed",
                                    reason="勒让德符号简写（(a/p) 链），不是除法",
                                    line=item.line, kind=item.kind, relations=len(ops))
+        # 4) 远大于 / 远小于：n >> 0、x \ll 1
+        if _ASYM_RE.search(item.latex):
+            return CheckDetail(latex=item.latex, status="parsed",
+                               reason="含远大于/远小于记号（>> \\ll），非精确数值关系",
+                               line=item.line, kind=item.kind, relations=len(ops))
+        # 5a) 商集 T(H)/{\sim}
+        if _QUOTIENT_RE.search(item.latex):
+            return CheckDetail(latex=item.latex, status="parsed",
+                               reason="商集记号（/\\sim 或 /{≃}），非除法等式",
+                               line=item.line, kind=item.kind, relations=len(ops))
+        # 5b) 循环小数 3122=\overline{1322}
+        if _OVERLINE_NUM_RE.search(item.latex):
+            return CheckDetail(latex=item.latex, status="parsed",
+                               reason="循环小数记号（\\overline 表示循环节），非普通数值",
+                               line=item.line, kind=item.kind, relations=len(ops))
+        # 5c) 概率记号 \pr{...}
+        if _PROB_OP_RE.search(item.latex):
+            return CheckDetail(latex=item.latex, status="parsed",
+                               reason="概率记号（\\pr{...}），内部等号不是外层数值断言",
+                               line=item.line, kind=item.kind, relations=len(ops))
         if _DERIV_NOTATION_RE.search(item.latex):
             return CheckDetail(latex=item.latex, status="parsed",
                                reason="导数记号说明（如 '=d/dτ），不是数值断言",
@@ -2398,6 +2547,13 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
             #    开头型：=2\times10^{-4}   /   \ge5
             #    两者都不是笔误，是 alignsplit 断行的产物。
             stripped = item.latex.strip()
+            # ⚠ \sim 结尾：X_1,\dots,X_n \sim N(0,1) 被行内公式切断，
+            #   单独看是「以 \sim 结尾」，属于续行而非笔误。
+            #   实证（arXiv:2611.16482）：X_1,\dots,X_n \sim 被判缺操作数。
+            if re.search(r"\\sim\s*$", stripped):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="以 \\sim 结尾的行内片段（下一段才是分布），非笔误",
+                                   line=item.line, kind=item.kind)
             # 「续行」必须真的是排版断行产物，而不是一句写错了的公式。
             # 判据（缺一不可）：
             #   · 出现在行间公式里（display/inline 都可能，但 inline 不能太短）；
@@ -2413,6 +2569,10 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
             #   实际区分：右边非空（开头型）通常可信；结尾型需要更多 token 佐证。
             looks_like_continuation = has_display_hint or token_count > 3
             # 开头型：=、>=、\ge 在开头，右边必须有内容 —— 这是明确的续行
+            # 开头型：=、>=、\ge、< 在开头，右边必须有内容 —— 这是明确的续行或不完整关系
+            # ⚠ 包括 `<`：\lt 在宏库映射成 `<`，而有些论文里 \lt 是作者自定义宏，
+            #    展开成 `<` 后左边为空。实证（arXiv:2611.15832）：\lt B、
+            #    \widehat B:=\lt B 被判缺操作数——其实是作者自定义宏，不是笔误。
             if re.match(r"^\s*(?:[=<>]|\\le|\\leq|\\ge|\\geq|\\neq|\\ne|\\equiv|\\sim|\\approx"
                         r"|\\simeq|\\cong|\\propto)\s*\S", stripped):
                 return CheckDetail(latex=item.latex, status="skip",
@@ -2433,6 +2593,27 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
                     or re.fullmatch(r"\s*\\stackrel\s*\{[^{}]*\}\s*\{[^{}]*\}\s*", item.latex):
                 return CheckDetail(latex=item.latex, status="skip",
                                    reason="关系符号本身（如 \\overset{d}{=} 依分布相等），非完整公式",
+                                   line=item.line, kind=item.kind)
+            # 7) 「未定义的自定义宏」：\lt B、\foo x 这类单字母宏在**
+            #    作者自己定义**时（如 \def\lt{...}）有其含义，只是工具不知道。
+            #    ⚠ \lt 在宏库里映射成 `<`，`\lt B` 会变成 `< B`（左空），
+            #      但原文是 `\lt B`——这是作者自定义，不是笔误。
+            #    实证（arXiv:2611.15832）：\lt B、\widehat B:=\lt B 被判缺操作数。
+            #    因此用**原始 LaTeX** 判断：以 \cmd 开头且该 cmd ≠ 关系符命令，
+            #    就是无法判定的自定义宏。
+            _RELATION_CMDS = {"le", "leq", "ge", "geq", "ne", "neq", "equiv",
+                              "sim", "approx", "simeq", "cong", "propto", "to",
+                              "implies", "iff", "ll", "gg", "prec", "succ",
+                              "subset", "supset", "in", "notin", "mid"}
+            m_lead = re.match(r"\s*\\([A-Za-z]+)\s*\S", item.original or "")
+            if m_lead and m_lead.group(1) not in _RELATION_CMDS:
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason=f"以自定义宏 \\{m_lead.group(1)} 开头，无法判定其含义",
+                                   line=item.line, kind=item.kind)
+            unknown_cmd = re.match(r"\s*\\([A-Za-z]+)\s*\S", stripped)
+            if unknown_cmd and unknown_cmd.group(1) not in _KNOWN_CMDS:
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason=f"含未定义的自定义宏（\\{unknown_cmd.group(1)}），无法判定",
                                    line=item.line, kind=item.kind)
             return CheckDetail(latex=item.latex, status="error",
                                reason="关系符缺少一侧操作数，疑似笔误",
@@ -3261,12 +3442,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_USAGE
 
     # 乱码防护：编码认不出时，后续扫描会静默失败却仍报「通过」——必须拦住。
+    # ⚠ 但**乱码若只出现在注释/正文里，不影响公式判定**，不必整个拒绝。
+    #   实证（arXiv:2611.17082v1，RegL1，84 篇批量测试）：
+    #     某行注释里 `% Théorème` 的 é 被作者上传时转坏成 U+FFFD，
+    #     4 个乱码字符全在注释中，却导致整篇被拒绝——过度严格。
+    #   判据：剥离公式后**仍**有乱码 → 乱码在公式外，警告即可继续；
+    #         剥离后乱码**消失**   → 乱码在公式里，判定不可信，必须拒绝。
     if "\ufffd" in doc.text:
         bad = doc.text.count("\ufffd")
-        print(f"{S.RED}✘ 文件编码无法识别{S.RESET}：检测到 {bad} 处乱码字符（U+FFFD）。")
-        print(f"  {S.DIM}该文件可能使用了 GBK/Big5/UTF-16 等编码，或本身已损坏。")
-        print(f"  在编辑器里确认编码后另存为 UTF-8，再重新运行。{S.RESET}")
-        return EXIT_USAGE
+        no_math = _MATH_ENV_RE.sub(" ", doc.text)
+        no_math = _INLINE_MATH_RE.sub(" ", no_math)
+        no_math = _DISPLAY_RE.sub(" ", no_math)
+        if "\ufffd" not in no_math:
+            print(f"{S.RED}✘ 文件编码无法识别{S.RESET}：检测到 {bad} 处乱码字符（U+FFFD）在公式里。")
+            print(f"  {S.DIM}该文件可能使用了 GBK/Big5/UTF-16 等编码，或本身已损坏。")
+            print(f"  在编辑器里确认编码后另存为 UTF-8，再重新运行。{S.RESET}")
+            return EXIT_USAGE
+        print(f"{S.YELLOW}⚠ 文件有 {bad} 处乱码字符（U+FFFD）{S.RESET}"
+              f"{S.DIM}，但都在公式之外（注释或正文），不影响判定。{S.RESET}")
 
     _, sympy_desc = _sympy_available()
     env_lines: List[str] = [sympy_desc, "超长整数保护 ✔" if LONGINT_SAFE else "超长整数保护 —"]
@@ -3372,6 +3565,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_ISSUES
     return EXIT_OK
 
+
+# 宏库加载后立即构建「已知命令」集合（见 _build_known_cmds 的说明）
+_KNOWN_CMDS = _build_known_cmds()
 
 if __name__ == "__main__":
     sys.exit(safe_main())
