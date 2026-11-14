@@ -169,6 +169,41 @@ def main() -> int:
     if not ok:
         fails.append(f"退出码分级: 预期 3，实际 {r.returncode}")
 
+    print("\n[语法检查：环境与括号配对]")
+    BS = "\\"
+    syn_cases = [
+        ("正常文档", "x=1", 0),
+        ("缺 \\end", BS + "begin{proof} ok", 1),
+        ("环境名不符", BS + "begin{equation} x " + BS + "end{align}", 1),
+        ("少右花括号", BS + "frac{1}{2", 1),
+        ("缺 \\right", BS + "left(x", 1),
+        ("正常 \\left\\right", BS + "left(x" + BS + "right)", 0),
+        ("转义花括号不算错", BS + "{" + BS + "}", 0),
+        ("宏定义里的括号不算错", BS + "def" + BS + "x{" + BS + "left(}", 0),
+        ("CJK 壳环境不误报", BS + "begin{CJK*}{GBK}{song} " + BS + "begin{proof}x"
+         + BS + "end{proof} " + BS + "end{CJK*}", 0),
+    ]
+    for desc, body, expect_n in syn_cases:
+        text = "\\documentclass{article}\n\\begin{document}\n" + body + "\n\\end{document}\n"
+        tmpf = os.path.join(tempfile.gettempdir(), "_mg_syn_test.tex")
+        open(tmpf, "w", encoding="utf-8").write(text)
+        d = m.read_tex(tmpf)
+        errs, _ = m.syntax_check(d)
+        # document 壳环境不参与配对检查，所以"缺 end"类用例只统计非 document 的问题
+        real = [e for e in errs if "document" not in (e.message or "")]
+        ok = len(real) == expect_n
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:20} 预期={expect_n} 实际={len(real)}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {expect_n} 个语法问题，实际 {len(real)}")
+            for e in real[:3]:
+                print(f"        L{e.line} {e.message[:60]}")
+        try:
+            os.remove(tmpf)
+        except OSError:
+            pass
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 

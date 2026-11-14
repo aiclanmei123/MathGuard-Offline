@@ -161,6 +161,15 @@ def safe_main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 @dataclass
+class SyntaxIssue:
+    """一条语法级问题（环境/括号配对等），只做静态检查，不涉及数学。"""
+    kind: str      # env-unclosed / env-mismatch / brace / left-right
+    line: int
+    message: str
+    file: str = ""
+
+
+@dataclass
 class LabelDef:
     key: str
     line: int
@@ -186,6 +195,8 @@ class StructureReport:
     cite_keys: int = 0
     source: str = "builtin"
     disputed: List[RefUse] = field(default_factory=list)  # 两工具结论不一致、待人工确认
+    syntax_errors: List["SyntaxIssue"] = field(default_factory=list)   # 语法级致命错误
+    syntax_warns: List["SyntaxIssue"] = field(default_factory=list)    # 语法级警告
 
 
 @dataclass
@@ -621,6 +632,234 @@ def _strip_prefix(key: str) -> str:
 def _overlaps(span: Tuple[int, int], occupied: List[Tuple[int, int]]) -> bool:
     a, b = span
     return any(a < y and x < b for x, y in occupied)
+
+
+# ======================================================================
+# 模块三 / 七：语法层静态检查（只做文本结构，不碰数学）
+# ======================================================================
+# 定位：这两类问题会让 LaTeX 直接编译失败，或者报错信息离真正的错处很远。
+# 它们是最值得自动化、也最容易做到零假阳性的检查。
+
+_ENV_TOKEN_RE = re.compile(r"\\(begin|end)\s*\{([^}]*)\}")
+_LEFT_RIGHT_RE = re.compile(r"\\(left|right|bigl|bigr|Bigl|Bigr|biggl|biggr)\s*(\\[()\[\]{}|.<>]"
+                            r"|\\\{|\\\}|[()\[\]|.])")
+# verbatim 类环境整体跳过（里面内容原样，不应检查括号）
+_VERBATIM_ENVS = {"verbatim", "verbatim*", "Verbatim", "lstlisting", "minted", "comment", "alltt"}
+
+
+def _blank_macro_definitions(text: str) -> str:
+    r"""把 \def / \newcommand 的**定义体**替换成等长空格。
+
+    为什么要这样做：宏定义体里的 \begin/\end、花括号是"定义语法"，
+    不是真实的环境或配对使用。实测：
+      · \def\({ \left(}                     —— 重定义定界符
+      · \def\FF#1#2#3{{}_2F_1\bigg(\bmatrix{#1}\\{#2}\end{bmatrix}\bigg|#3\bigg)}
+        —— 宏体里含 \begin{bmatrix}/ \end{bmatrix}
+    不剥离就会误报"环境不匹配"。
+
+    用逐字符扫描做花括号配对，支持宏体里嵌套花括号。
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    pat = re.compile(r"\\(def|gdef|edef|xdef|newcommand|renewcommand|providecommand)\b")
+    while i < n:
+        m = pat.search(text, i)
+        if not m:
+            break
+        j = m.end()
+        # 跳到第一个未转义的 '{'，那之前是宏名/参数个数说明
+        while j < n and text[j] != "{":
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == "\n" and j > m.end() + 200:
+                j = -1
+                break
+            j += 1
+        if j < 0 or j >= n:
+            i = m.end()
+            continue
+        # 逐字符配对，取出整个定义体
+        depth, k = 0, j
+        while k < n:
+            c = text[k]
+            if c == "\\":
+                k += 2
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if k < n:
+            for p in range(m.start(), k + 1):
+                if text[p] != "\n":
+                    out[p] = " "
+            i = k + 1
+        else:
+            i = m.end()
+    return "".join(out)
+
+
+def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
+    r"""模块三：\begin{xxx} 与 \end{xxx} 是否配对。
+
+    LaTeX 里环境必须严格嵌套闭合。常见事故：
+      · 写了 \begin{proof} 忘了 \end{proof}
+      · \begin{equation} ... \end{align}（名字写错）
+      · 嵌套错序：\begin{a}\begin{b}\end{a}\end{b}
+
+    注意：只检查**本文件内**能看到的配对。\input 的子文件已被展开，所以是全文级检查。
+    verbatim / lstlisting 里的内容不参与（那里面的 \begin 是字面文本）。
+    """
+    issues: List[SyntaxIssue] = []
+    # 先把 verbatim 类环境内容抹掉，避免误判
+    scan = text
+    for env in _VERBATIM_ENVS:
+        scan = re.sub(r"\\begin\s*\{" + re.escape(env) + r"\}.*?\\end\s*\{" + re.escape(env) + r"\}",
+                      lambda mm: " " * len(mm.group(0)), scan, flags=re.S)
+    scan = _blank_macro_definitions(scan)
+    # CJK 风格环境（\begin{CJK*}{GBK}{song} ... \end{CJK*}）会横跨整篇文档，
+    # 里面嵌套 proof/theorem 完全是合法的。这类「壳环境」不参与配对检查。
+    _SHELL_ENVS = {"CJK", "CJK*", "CJKutf8", "document", "otherlanguage", "otherlanguage*"}
+
+    stack: List[Tuple[str, int]] = []   # (环境名, 起始偏移)
+    for m in _ENV_TOKEN_RE.finditer(scan):
+        kind, name = m.group(1), m.group(2).strip()
+        if name in _VERBATIM_ENVS or name in _SHELL_ENVS:
+            continue
+        if kind == "begin":
+            stack.append((name, m.start()))
+        else:
+            if not stack:
+                f, ln = doc.origin(m.start())
+                issues.append(SyntaxIssue("env-unopened", ln,
+                                          f"多出的 \\end{{{name}}}（此前没有对应的 \\begin）",
+                                          os.path.basename(f)))
+                continue
+            open_name, open_pos = stack[-1]
+            if open_name == name:
+                stack.pop()
+            else:
+                # 找一找这个 name 是否在更深处
+                depth = None
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i][0] == name:
+                        depth = i
+                        break
+                f, ln = doc.origin(m.start())
+                if depth is None:
+                    # 等价于"这个 \end 是多余的" + "最近的 \begin 没闭合"，
+                    # 是同一个错误的两面。合成一条，避免同一行刷两条。
+                    f, ln = doc.origin(m.start())
+                    f0, ln0 = doc.origin(open_pos)
+                    issues.append(SyntaxIssue(
+                        "env-mismatch", ln,
+                        f"\\begin{{{open_name}}}（第 {ln0} 行）与 \\end{{{name}}} 不匹配"
+                        f"（环境名或嵌套顺序有误）",
+                        os.path.basename(f)))
+                    stack.pop()   # 一并关掉，避免再报"未闭合"
+                else:
+                    f0, ln0 = doc.origin(stack[depth][1])
+                    issues.append(SyntaxIssue(
+                        "env-order", ln,
+                        f"环境嵌套错序：\\begin{{{name}}}（第 {ln0} 行）尚未闭合，"
+                        f"却先遇到 \\end{{{name}}}；中间 \\begin{{{open_name}}} 未闭合",
+                        os.path.basename(f)))
+                    del stack[depth:]
+
+    # 剩下未闭合的：按出现顺序报告，并指出它"一直没关"
+    for name, pos in stack:
+        f, ln = doc.origin(pos)
+        issues.append(SyntaxIssue("env-unclosed", ln,
+                                  f"\\begin{{{name}}} 没有对应的 \\end{{{name}}}（可能在文件末尾）",
+                                  os.path.basename(f)))
+    return issues
+
+
+def check_braces(text: str, doc: TexDocument) -> List[SyntaxIssue]:
+    r"""模块七：花括号 {} 与 \left...\right 的配对。
+
+    用栈扫描，跳过：
+      · 注释（% 到行尾）
+      · 转义的花括号 \{ \}
+      · verbatim 类环境
+      · 数学公式之间的正文（正文里的花括号同样要配对，所以照样检查）
+
+    ⚠ 说明：LaTeX 允许 \{ \} 作为字面量，那不算错的配对。
+    """
+    issues: List[SyntaxIssue] = []
+    scan = mask_comments(text)
+    for env in _VERBATIM_ENVS:
+        scan = re.sub(r"\\begin\s*\{" + re.escape(env) + r"\}.*?\\end\s*\{" + re.escape(env) + r"\}",
+                      lambda mm: " " * len(mm.group(0)), scan, flags=re.S)
+    # \def\({...} 这类定义里的括号是"语法定义"，不是真实的括号使用：
+    # 实测 ArtMathResearch.tex 用 \def\({ \left(} 重定义定界符，会被误报。
+    scan = re.sub(r"\\(?:def|gdef|edef|xdef)\s*\\(?:[A-Za-z]+|.)\s*\{[^{}]*\}",
+                  lambda mm: " " * len(mm.group(0)), scan)
+
+    stack: List[Tuple[str, int]] = []
+    i, n = 0, len(scan)
+    while i < n:
+        ch = scan[i]
+        if ch == "\\":
+            # 转义的花括号 \{ \} 跳过
+            if i + 1 < n and scan[i + 1] in "{}":
+                i += 2
+                continue
+            m = _LEFT_RIGHT_RE.match(scan, i)
+            if m:
+                which = m.group(1)
+                if which in ("left", "bigl", "Bigl", "biggl", "Biggl"):
+                    stack.append(("\\left", i))
+                elif which in ("right", "bigr", "Bigr", "biggr", "Biggr"):
+                    if stack and stack[-1][0] == "\\left":
+                        stack.pop()
+                    else:
+                        f, ln = doc.origin(i)
+                        issues.append(SyntaxIssue("left-right", ln,
+                                                  "\\right 之前没有匹配的 \\left",
+                                                  os.path.basename(f)))
+                i = m.end()
+                continue
+            i += 2
+            continue
+        if ch == "{":
+            stack.append(("{", i))
+        elif ch == "}":
+            if stack and stack[-1][0] == "{":
+                stack.pop()
+            else:
+                f, ln = doc.origin(i)
+                issues.append(SyntaxIssue("brace", ln, "多余的右花括号 }", os.path.basename(f)))
+        i += 1
+
+    for kind, pos in stack:
+        f, ln = doc.origin(pos)
+        if kind == "{":
+            issues.append(SyntaxIssue("brace", ln, "左花括号 { 没有闭合", os.path.basename(f)))
+        else:
+            issues.append(SyntaxIssue("left-right", ln,
+                                      "\\left 没有对应的 \\right", os.path.basename(f)))
+    return issues
+
+
+def syntax_check(doc: TexDocument) -> Tuple[List[SyntaxIssue], List[SyntaxIssue]]:
+    """跑全部语法检查，返回 (致命错误, 警告)。任何异常都隔离，不影响主流程。"""
+    errors: List[SyntaxIssue] = []
+    warns: List[SyntaxIssue] = []
+    for fn, bucket in ((check_environments, errors), (check_braces, errors)):
+        try:
+            bucket.extend(fn(doc.text, doc))
+        except Exception as exc:
+            warns.append(SyntaxIssue("internal", 0, f"{fn.__name__} 执行异常已隔离：{type(exc).__name__}"))
+    # 同一位置同类问题只保留一条
+    errors = list({(e.kind, e.line, e.message): e for e in errors}.values())
+    errors.sort(key=lambda e: e.line)
+    warns.sort(key=lambda e: e.line)
+    return errors, warns
 
 
 # ======================================================================
@@ -1972,7 +2211,9 @@ def build_report(info_file: FileInfo, structure: StructureReport, formulas: Mock
     out: List[str] = []
     add = out.append
     n_ok, n_skip, n_err = formulas.verified, formulas.skipped, formulas.errors
-    n_struct = len(structure.orphans) + len(structure.undefined)
+    # 语法错误也算"结构问题"：它同样会阻止编译成功
+    n_struct = (len(structure.orphans) + len(structure.undefined)
+                + len(getattr(structure, "syntax_errors", []) or []))
     problems = n_struct + n_err
 
     add(_TITLE)
@@ -2008,7 +2249,22 @@ def build_report(info_file: FileInfo, structure: StructureReport, formulas: Mock
     if structure.duplicate:
         add(f"  {S.YELLOW}重复定义标签   : {len(structure.duplicate)} 个 —— "
             + "、".join(structure.duplicate[:6]) + ("…" if len(structure.duplicate) > 6 else "") + S.RESET)
+    # 语法层检查（模块三 / 七）
+    syn = getattr(structure, "syntax_errors", []) or []
+    if syn:
+        add(f"  {S.RED}语法问题       : {len(syn)} 处（环境/括号未配对，会导致编译失败）{S.RESET}")
+    else:
+        add(f"  语法问题       : {S.GREEN}0 处（环境与括号均配对）{S.RESET}")
     add("")
+
+    if syn:
+        add(f"  {S.RED}▲ 语法错误（LaTeX 会直接编译失败）{S.RESET}")
+        for e in syn[:max_detail]:
+            loc = f"{e.file}:{e.line}" if e.file else f"L{e.line}"
+            add(f"    {loc:<24} {e.message}")
+        if len(syn) > max_detail:
+            add(f"    {S.DIM}… 其余 {len(syn) - max_detail} 处已省略{S.RESET}")
+        add("")
 
     if structure.orphans:
         add(f"  {S.YELLOW}▲ 孤儿标签（定义了但从未被引用）{S.RESET}")
@@ -2359,6 +2615,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         builtin_report = None
         env_lines.append(f"内置解析器异常已隔离（{type(exc).__name__}）")
 
+    # ---------- 语法层检查（环境配对 / 括号配对）----------
+    try:
+        syn_errors, syn_warns = syntax_check(doc)
+    except Exception as exc:
+        syn_errors, syn_warns = [], []
+        env_lines.append(f"语法检查异常已隔离（{type(exc).__name__}）")
+    if builtin_report is not None:
+        builtin_report.syntax_errors = syn_errors
+        builtin_report.syntax_warns = syn_warns
+
     nav_report, nav_status = try_latexnav(str(path))
     env_lines.append("latexnav: " + nav_status)
 
@@ -2374,6 +2640,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         structure = StructureReport()
         env_lines.append("结构检查: 无可用结果")
+
+    # 语法检查结果与 latexnav 无关（纯文本层面的配对），无论走哪条路径都要挂上。
+    # ⚠ 早期版本只赋给 builtin_report，而 _cross_check 返回的是新建对象，
+    #    导致报告里永远显示"语法问题 0 处"——实际有错也没报出来。
+    structure.syntax_errors = syn_errors
+    structure.syntax_warns = syn_warns
 
     # ---------- 模块二：公式验证 ----------
     # 策略：内置 sympy 验证器覆盖全部公式，始终给出底数；parsub 提供「数学等价性」的
