@@ -406,6 +406,43 @@ def main() -> int:
     if not ok:
         fails.append(f"renewcommand 覆盖失败: {mac2.get('C')}")
 
+    print("\n[中文 LaTeX 边界（ctexart，226 份中文文档实测）]")
+    cjk_tpl = ("\\documentclass{ctexart}\n\\usepackage{amsmath}\n"
+               "\\begin{document}\n%s\n\\end{document}\n")
+    # 这些**全部是合法写法**，必须 exit=0、0 语法问题、0 验证失败
+    cjk_legal = [
+        ("中文逗号夹公式", "由定理可知，$x=1$，因此成立。"),
+        ("公式后中文句号", "即 $x=1$。"),
+        ("中文括号包公式", "即（$x=1$）成立。"),
+        ("公式内全角逗号", "$x=\\frac{1}{2}，y=\\frac{1}{3}$"),
+        ("公式内全角括号", "$f（x）=x^{2}$"),
+        ("中文与公式无空格", "设$f(x)$为连续函数"),
+        ("全角空格", "$x\u3000=\u30001$"),
+        ("中文标签不等式", "$\\text{教育价值}\\ge P_{75}$"),
+        ("行内中文 text", "$\\text{其中}x=1$"),
+        ("equation 内中文", "\\begin{equation}\nx=1\\quad\\text{当}n\\ge1\\text{时}\n\\end{equation}"),
+        ("中文引号包公式", "所谓“$x=1$”成立"),
+        ("中文冒号后公式", "定义：$f(x)=x^2$"),
+        ("顿号分隔", "$x$、$y$、$z$"),
+    ]
+    for desc, body in cjk_legal:
+        tmpf = os.path.join(tempfile.gettempdir(), "_mg_cjk_test.tex")
+        open(tmpf, "w", encoding="utf-8").write(cjk_tpl % body)
+        r = subprocess.run([sys.executable, os.path.join(HERE, "math_guard.py"),
+                            tmpf, "--no-color"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", env=dict(os.environ, MATH_GUARD_PARSUB_MODE="off"))
+        ok = r.returncode == 0 and "0 处（环境与括号均配对）" in r.stdout
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:18} exit={r.returncode}")
+        if not ok:
+            fails.append(f"中文用例 {desc}: exit={r.returncode}")
+        try:
+            os.remove(tmpf)
+        except OSError:
+            pass
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 
