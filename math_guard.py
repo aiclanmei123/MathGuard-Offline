@@ -2679,6 +2679,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("file", nargs="?", help="path to the .tex file")
     p.add_argument("--demo", action="store_true", help="generate a sample .tex with problems and check it")
+    p.add_argument("--batch", nargs="+", metavar="PATH",
+                   help="check many files/directories in one run (much faster than one call per file)")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="with --batch: one line per file instead of full reports")
     p.add_argument("--parsub-worker", nargs=4, metavar=("TEX", "OUT", "VERIFY", "TASK_TIMEOUT"),
                    help=argparse.SUPPRESS)  # 内部使用：parsub 子进程入口
     p.add_argument("-v", "--verbose", action="store_true", help="list every math item, including skipped ones")
@@ -2884,6 +2888,159 @@ def _chapter_file_warning(path: Path, doc: TexDocument) -> str:
     return ""
 
 
+def _collect_tex_files(paths: List[str]) -> List[Path]:
+    """把命令行给的路径展开成 .tex 文件列表（目录则递归查找）。"""
+    from pathlib import Path
+    skip_dirs = {"node_modules", ".git", "__pycache__", "_internal", "build",
+                 "dist", "site-packages", ".venv", "venv"}
+    out: List[Path] = []
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if p.is_file() and p.suffix.lower() == ".tex":
+            out.append(p)
+        elif p.is_dir():
+            for dp, dns, fns in os.walk(p):
+                dns[:] = [d for d in dns if d not in skip_dirs]
+                for fn in fns:
+                    if fn.lower().endswith(".tex"):
+                        out.append(Path(dp) / fn)
+    # 去重并按路径排序，输出稳定
+    seen = set()
+    uniq = []
+    for p in out:
+        try:
+            key = p.resolve()
+        except OSError:
+            key = p
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    return sorted(uniq, key=lambda x: str(x).lower())
+
+
+def _run_batch(paths: List[str], lint: bool = False, quiet: bool = False) -> int:
+    """批处理：一次进程内检查多个文件，共享 sympy 加载开销。
+
+    为什么需要：单文件跑一次约 2 秒，其中 ~0.7 秒是 import sympy 的固定成本。
+    逐篇调用 200 篇要 400 秒；本函数只付一次启动成本。
+
+    实现方式：递归调用 main() 自身，复用完整的单文件流程（不重复实现逻辑）。
+    批处理时 sys.stdout 被重定向到收集器，因此每篇的报告会被捕获。
+    """
+    files = _collect_tex_files(paths)
+    if not files:
+        print(f"{S.RED}✘ 没有找到任何 .tex 文件{S.RESET}")
+        return EXIT_USAGE
+
+    t0 = time.time()
+    print(f"{S.DIM}批处理：{len(files)} 个文件"
+          f"{'（--lint 已开启）' if lint else ''}{S.RESET}")
+
+    # 预加载 sympy：只付一次成本
+    _sympy_available()
+
+    real_stdout = sys.stdout
+    results = []
+    for idx, path in enumerate(files, 1):
+        buf: List[str] = []
+        t_file = time.time()
+        try:
+            sys.stdout = _TeeWriter(buf)
+            code = main([str(path)] + (["--lint"] if lint else [])
+                        + ["--no-color", "--max-detail", "4"])
+        except SystemExit as e:
+            code = int(e.code) if isinstance(e.code, int) else EXIT_INTERNAL
+        except Exception as exc:
+            code = EXIT_INTERNAL
+            buf.append(f"内部错误 {type(exc).__name__}: {exc}")
+        finally:
+            sys.stdout = real_stdout
+        dt = time.time() - t_file
+        text = "".join(buf)
+
+        summary = ""
+        for line in text.splitlines():
+            s = " ".join(line.split())
+            if s.startswith("语法问题"):
+                v = s.split(":", 1)[1].strip()
+                if not v.startswith("0 处"):
+                    summary += f"语法{v[:4]}|"
+            elif s.startswith("孤儿标签"):
+                m_ = re.search(r"孤儿标签\s*:\s*(\d+)", s)
+                if m_ and m_.group(1) != "0":
+                    summary += f"孤儿{m_.group(1)}|"
+            elif s.startswith("已验证通过 /"):
+                parts = s.split(":", 1)[1].strip().split("/")
+                if len(parts) >= 2 and parts[1].strip() != "0":
+                    summary += f"失败{parts[1].strip()}"
+        results.append((path, code, summary.strip("|"), dt, text))
+
+        if quiet:
+            mark = {0: f"{S.GREEN}OK  {S.RESET}", 1: f"{S.YELLOW}结构{S.RESET}",
+                    3: f"{S.RED}错误{S.RESET}"}.get(code, f"{S.RED}!{code} {S.RESET}")
+            print(f"  [{idx}/{len(files)}] {mark} {dt:5.1f}s  {path.name:<32} {summary}")
+        else:
+            print()
+            print(f"{S.BOLD}{'─' * 66}{S.RESET}")
+            print(f"{S.BOLD}[{idx}/{len(files)}] {path}{S.RESET}")
+            print(text.rstrip())
+        if idx % 25 == 0:
+            print(f"{S.DIM}  … {idx}/{len(files)}，累计 {time.time()-t0:.0f}s{S.RESET}",
+                  flush=True)
+
+    buckets: Dict[int, List] = {0: [], 1: [], 2: [], 3: [], 4: []}
+    for path, code, summary, dt, _t in results:
+        buckets.setdefault(code, []).append((path, summary))
+
+    total = time.time() - t0
+    print()
+    print(f"{S.BOLD}{'═' * 66}{S.RESET}")
+    print(f"{S.BOLD}批处理汇总{S.RESET}  {len(files)} 个文件 / {total:.1f}s"
+          f"  （平均 {total/max(1,len(files)):.2f}s/篇）")
+    print(f"{S.BOLD}{'═' * 66}{S.RESET}")
+    print(f"  {S.GREEN}干净       {len(buckets.get(0, []))}{S.RESET}")
+    print(f"  {S.YELLOW}仅结构问题 {len(buckets.get(1, []))}{S.RESET}")
+    print(f"  {S.RED}数学错误   {len(buckets.get(3, []))}{S.RESET}")
+    nbad = len(buckets.get(2, [])) + len(buckets.get(4, []))
+    if nbad:
+        print(f"  用法/内部  {nbad}")
+
+    for label, key in (("数学错误", 3), ("内部错误", 4), ("用法错误", 2)):
+        items = buckets.get(key, [])
+        if items:
+            print(f"\n  {S.RED}▲ {label}{S.RESET}")
+            for p, s in items[:15]:
+                print(f"    {p.name:<34} {s}")
+            if len(items) > 15:
+                print(f"    {S.DIM}… 其余 {len(items) - 15} 个已省略{S.RESET}")
+
+    if buckets.get(2):
+        return EXIT_USAGE
+    if buckets.get(3):
+        return 3
+    if buckets.get(1):
+        return 1
+    return 0
+
+
+class _TeeWriter:
+    """收集 print 输出到列表（批处理时替代真实 stdout）。"""
+
+    def __init__(self, sink: List[str]):
+        self.sink = sink
+
+    def write(self, s: str) -> int:
+        self.sink.append(s)
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global S
     _init_console()
@@ -2892,6 +3049,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.demo:
         return _run_demo()
+
+    # 批处理模式：一次启动跑多个文件/目录，共享 sympy 加载开销。
+    # 单篇 2 秒里有 ~0.7 秒是 import sympy 的固定成本；跑 200 篇时
+    # 逐篇调用要 400 秒，而一次启动只要 ~60 秒。
+    if args.batch:
+        return _run_batch(args.batch, lint=args.lint, quiet=args.quiet)
 
     # 隐藏子命令：parsub 在独立进程中执行（由 _run_parsub_isolated 调用）
     if args.parsub_worker:

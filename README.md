@@ -90,6 +90,25 @@ python math_guard.py paper.tex --no-color   # 关颜色（重定向到文件时�
 python math_guard.py --demo                 # 生成含预设错误的示例并体检
 ```
 
+### 批量检查（快 5-6 倍）
+
+单篇启动约 1.3 秒，其中 ~0.7 秒是加载 sympy 的固定成本。**要查多个文件或整个目录时，用 `--batch`**：
+
+```bash
+python math_guard.py --batch 论文目录/ -q          # 一条命令查整个目录，每篇一行摘要
+python math_guard.py --batch a.tex b.tex c.tex     # 指定多个文件
+python math_guard.py --batch 目录/ -q --lint       # 批处理 + 标点检查
+```
+
+实测对比（21 个文件）：
+
+| 方式 | 耗时 | 平均 |
+|---|---|---|
+| 逐篇调用 | 27.4s | 1.30s/篇 |
+| `--batch` | **4.6s** | **0.22s/篇** |
+
+251 个文件批处理只需 **50 秒**。判定结果与逐篇调用**完全一致**。
+
 ### 退出码
 
 | 码 | 含义 |

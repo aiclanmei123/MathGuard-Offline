@@ -443,6 +443,38 @@ def main() -> int:
         except OSError:
             pass
 
+    print("\n[批处理模式 --batch]")
+    # 造一个目录，放 3 个文件：一个干净、一个结构问题、一个数学错误
+    bdir = os.path.join(tempfile.gettempdir(), "_mg_batch_test")
+    os.makedirs(bdir, exist_ok=True)
+    cases = {
+        "clean.tex": "\\documentclass{article}\n\\begin{document}\n$2+2=4$\n\\end{document}\n",
+        "struct.tex": "\\documentclass{article}\n\\begin{document}\n\\label{orphan}\n\\end{document}\n",
+        "wrong.tex": "\\documentclass{article}\n\\begin{document}\n$2+2=5$\n\\end{document}\n",
+    }
+    for fn, body in cases.items():
+        open(os.path.join(bdir, fn), "w", encoding="utf-8").write(body)
+    r = subprocess.run([sys.executable, os.path.join(HERE, "math_guard.py"),
+                        "--batch", bdir, "-q", "--no-color"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=dict(os.environ, MATH_GUARD_PARSUB_MODE="off"))
+    out = r.stdout
+    checks = [
+        ("识别 3 个文件", "3 个文件" in out),
+        ("汇总干净 1", "干净       1" in out),
+        ("汇总结构 1", "仅结构问题 1" in out),
+        ("汇总错误 1", "数学错误   1" in out),
+        ("退出码 3(有数学错误)", r.returncode == 3),
+    ]
+    for desc, ok in checks:
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc}")
+        if not ok:
+            fails.append(f"批处理 {desc}: exit={r.returncode}")
+    import shutil as _sh
+    _sh.rmtree(bdir, ignore_errors=True)
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 
