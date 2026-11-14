@@ -204,6 +204,33 @@ def main() -> int:
         except OSError:
             pass
 
+    print("\n[模块六：公式标点检查]")
+    punct_cases = [
+        ("有句号", BS + "begin{equation} x=1. " + BS + "end{equation}", 0),
+        ("有逗号", BS + "begin{equation} x=1, " + BS + "end{equation}", 0),
+        ("中文句号", BS + "begin{equation} x=1" + BS + "text{。} " + BS + "end{equation}", 0),
+        ("无标点", BS + "begin{equation} x=1 " + BS + "end{equation}", 1),
+        ("带label无标点", BS + "begin{equation}" + BS + "label{e} x=1 " + BS + "end{equation}", 1),
+        ("逗号+换行", BS + "begin{equation} x," + BS + BS + " " + BS + "end{equation}", 0),
+    ]
+    for desc, body, expect_n in punct_cases:
+        text = "\\documentclass{article}\n\\begin{document}\n" + body + "\n\\end{document}\n"
+        tmpf = os.path.join(tempfile.gettempdir(), "_mg_punct_test.tex")
+        open(tmpf, "w", encoding="utf-8").write(text)
+        d = m.read_tex(tmpf)
+        _, ws = m.syntax_check(d)
+        pw = [w for w in ws if w.kind == "punct"]
+        ok = len(pw) == expect_n
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:14} 预期={expect_n} 实际={len(pw)}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {expect_n} 条标点警告，实际 {len(pw)}")
+        try:
+            os.remove(tmpf)
+        except OSError:
+            pass
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 

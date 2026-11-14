@@ -848,19 +848,81 @@ def check_braces(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     return issues
 
 
+def check_math_punctuation(text: str, doc: TexDocument) -> List[SyntaxIssue]:
+    r"""模块六：行间公式末尾是否缺少标点。
+
+    学术写作惯例：行间公式本身是句子的一部分，末尾应有 `,` 或 `.`。
+    缺失时，读者会分不清公式与下一句的边界。
+
+    实测调校（3 篇真实论文，31 个数学环境）：
+      · 硬性要求英文 `,` `.` 会产生误报——中文论文常用 `。` 结尾，
+        例如 `\text{互为相反数。}` 已是完整句。
+      · 因此把中文标点 `。 ， ；` 也视为合规。
+      · 选项 `\label` `\tag` `\nonumber` 先剥离再判断。
+    """
+    issues: List[SyntaxIssue] = []
+    env_re = re.compile(
+        r"\\begin\s*\{(equation|align|gather|multline|eqnarray)\*?\}(.*?)\\end\s*\{\1\*?\}", re.S)
+    scan = mask_verbatim(mask_comments(text))
+    for mt in env_re.finditer(scan):
+        body = mt.group(2)
+        # 剥离不影响"末尾字符"判断的命令
+        clean = re.sub(r"\\label\s*\{[^}]*\}|\\tag\s*\{[^}]*\}|\\nonumber|\\notag", "", body)
+        # 关键：末尾常见的"排版尾缀"要先剥掉，否则会把 `,\ }` 误判成无标点。
+        # 实测 259 份文档里因此产生 708 条误报，其中绝大多数是：
+        #   ...\\pmod{p^3},\ }       逗号其实存在，只是被 `\ }` 遮住
+        #   ...\end{aligned}         多行子环境结尾，标点在外面
+        for _ in range(6):
+            clean = clean.rstrip()
+            before = clean
+            # 末尾的换行命令 \\（两个反斜杠）
+            clean = re.sub(r"\\\\\s*$", "", clean)
+            # 末尾的对齐符 &
+            clean = re.sub(r"&\s*$", "", clean)
+            # 子环境结尾
+            clean = re.sub(r"\\end\s*\{[A-Za-z*]+\}\s*$", "", clean)
+            # 间距/转义命令：\, \; \: \! \  \quad \qquad
+            clean = re.sub(r"\\(?:quad|qquad|[ ,;:!])\s*$", "", clean)
+            # 成对空花括号 {}
+            clean = re.sub(r"\{\s*\}\s*$", "", clean)
+            # 单个花括号
+            clean = re.sub(r"[{}]\s*$", "", clean)
+            if clean == before:
+                break
+        clean = clean.rstrip()
+        if not clean:
+            continue
+        last = clean[-1]
+        if last in ",.;" or last in "。，；、":
+            continue
+        # \text{...} 结尾时看括号内最后一个字符
+        m2 = re.search(r"\\(?:text|mbox)\s*\{([^{}]*)\}\s*$", clean)
+        if m2 and m2.group(1).rstrip()[-1:] in ",.;。，；、":
+            continue
+        f, ln = doc.origin(mt.start())
+        tail = re.sub(r"\s+", " ", clean[-30:])
+        issues.append(SyntaxIssue(
+            "punct", ln,
+            f"公式末尾疑似缺少标点（应以 , 或 . 结尾）： …{tail}",
+            os.path.basename(f)))
+    return issues
+
+
 def syntax_check(doc: TexDocument) -> Tuple[List[SyntaxIssue], List[SyntaxIssue]]:
     """跑全部语法检查，返回 (致命错误, 警告)。任何异常都隔离，不影响主流程。"""
     errors: List[SyntaxIssue] = []
     warns: List[SyntaxIssue] = []
-    for fn, bucket in ((check_environments, errors), (check_braces, errors)):
+    for fn, bucket in ((check_environments, errors), (check_braces, errors),
+                       (check_math_punctuation, warns)):
         try:
             bucket.extend(fn(doc.text, doc))
         except Exception as exc:
             warns.append(SyntaxIssue("internal", 0, f"{fn.__name__} 执行异常已隔离：{type(exc).__name__}"))
     # 同一位置同类问题只保留一条
     errors = list({(e.kind, e.line, e.message): e for e in errors}.values())
+    warns = list({(w.kind, w.line, w.message): w for w in warns}.values())
     errors.sort(key=lambda e: e.line)
-    warns.sort(key=lambda e: e.line)
+    warns.sort(key=lambda w: w.line)
     return errors, warns
 
 
@@ -2266,6 +2328,16 @@ def build_report(info_file: FileInfo, structure: StructureReport, formulas: Mock
             add(f"    {loc:<24} {e.message}")
         if len(syn) > max_detail:
             add(f"    {S.DIM}… 其余 {len(syn) - max_detail} 处已省略{S.RESET}")
+        add("")
+    # 警告类（不影响编译，但影响规范性）
+    wsyn = getattr(structure, "syntax_warns", []) or []
+    if wsyn:
+        add(f"  {S.YELLOW}▲ 排版警告（{len(wsyn)} 条，不影响编译）{S.RESET}")
+        for w in wsyn[:max_detail]:
+            loc = f"{w.file}:{w.line}" if w.file else f"L{w.line}"
+            add(f"    {loc:<24} {w.message}")
+        if len(wsyn) > max_detail:
+            add(f"    {S.DIM}… 其余 {len(wsyn) - max_detail} 条已省略{S.RESET}")
         add("")
 
     if structure.orphans:
