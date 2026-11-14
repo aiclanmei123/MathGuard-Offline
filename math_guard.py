@@ -669,6 +669,14 @@ _LEGENDRE_RE = re.compile(
     r"\s*\\[dt]?frac\s*\{[^{}]*\}\s*\{[^{}]*\}"
     r"\s*\\(?:right|bigr|Bigr|biggr|Biggr)\s*\)")
 
+# 1b) 勒让德符号的**简写形式**：(a/p)、(3/7)、(2/n)
+#     数论论文里到处都用这个写法表示「a 模 p 的二次剩余符号」，
+#     而不是把 a 除以 p。实测（arXiv:2611.17124，ZinQ）：
+#         (7/r)=(r/7)=(3/7)=-1
+#     被误判为 3/7 = -1。
+#     判据：整个公式里出现的 (n/d) 形态，且 d 是单个字母或小整数。
+_LEGENDRE_SHORT_RE = re.compile(r"\(\s*(\d{1,3}|[a-z])\s*/\s*(\d{1,3}|[a-z])\s*\)")
+
 # 2) 导数记号说明：{ }'=d/d\tau、f'=df/dx 之类，是"定义"而不是数值断言
 #    ⚠ 还有一类：行内公式「跨进正文」，等号右边根本没有数学内容：
 #      \(f' =\) restriction of the modular form \(f\) ...
@@ -2321,6 +2329,14 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
             return CheckDetail(latex=item.latex, status="parsed",
                                reason="勒让德/雅可比符号记号（a/p），不是除法等式",
                                line=item.line, kind=item.kind, relations=len(ops))
+        # 简写形式 (a/p)、(3/7)：整条公式全是这种记号链时，按勒让德符号处理
+        if _LEGENDRE_SHORT_RE.search(item.latex):
+            stripped = _LEGENDRE_SHORT_RE.sub("", item.latex)
+            # 去掉符号后若只剩 = -1 / = 1 这类值，说明整式是「符号 = 值」
+            if re.fullmatch(r"[\s=+\-−]*(-?1)?[\s,.]*", stripped):
+                return CheckDetail(latex=item.latex, status="parsed",
+                                   reason="勒让德符号简写（(a/p) 链），不是除法",
+                                   line=item.line, kind=item.kind, relations=len(ops))
         if _DERIV_NOTATION_RE.search(item.latex):
             return CheckDetail(latex=item.latex, status="parsed",
                                reason="导数记号说明（如 '=d/dτ），不是数值断言",
@@ -2509,8 +2525,14 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
             # 连等 / 链式比较的第二段之后不做数字断言：像
             #     22·27 = 594 ≡ 87 (mod 169)
             # 里 594 与 87 本就不相等（差一个模数），断言相等只会是假阳性。
+            # ⚠ 但**相邻两段都是纯数字**时必须断言，否则会漏报：
+            #     r(4)=16-6=11   —— 三段依次是 符号 / 16-6 / 11，
+            #     第二、三段都是纯数字，16-6=10≠11 是确定错误。
+            #   实测（变异测试 B01）：这处漏报过。
             if len(ops) > 1 and idx > 0:
-                continue
+                nxt = literal(parts[idx + 1]) if idx + 1 < len(parts) else None
+                if nxt is None:
+                    continue
             n_critical += 1
             try:
                 ok = {"=": lv == rv, "==": lv == rv, "<=": lv <= rv,

@@ -525,6 +525,27 @@ def main() -> int:
     except OSError:
         pass
 
+    print("\n[变异测试暴露的缺陷：链式等式里的数字段]")
+    # 实证（变异测试 B01）：r(4)=16-6=11 被判成"只含符号"，漏掉了 16-6=10≠11
+    # 实证（arXiv:2611.17124）：(7/r)=(r/7)=(3/7)=-1 是勒让德符号链
+    chain_cases = [
+        ("链式等式真错", "r(4)=16-6=11", "error"),
+        ("链式等式正确", "r(4)=16-6=10", "ok"),
+        ("符号=数字=错", "x=2+2=5", "error"),
+        ("符号=数字=对", "x=2+2=4", "ok"),
+        ("勒让德符号链", "(7/r)=(r/7)=(3/7)=-1", "parsed"),
+        ("单个勒让德", "(3/7)=-1", "parsed"),
+        ("真分数运算不受影响", "1/2+1/3=5/6", "ok"),
+    ]
+    for desc, latex, want in chain_cases:
+        d = m.verify_with_sympy(m.MathItem(kind="inline", line=1, latex=latex, original=latex))
+        ok = d.status == want
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:18} 预期={want} 实际={d.status}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {want}，实际 {d.status}")
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 
