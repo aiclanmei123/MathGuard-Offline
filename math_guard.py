@@ -3383,6 +3383,33 @@ class _TeeWriter:
         return False
 
 
+def collect_tex_files(paths: List[str]) -> List[Path]:
+    """公开接口：把路径列表展开成 .tex 文件列表（供 GUI 调用）。"""
+    return _collect_tex_files(paths)
+
+
+def check_single(path: "Path | str", lint: bool = False,
+                sink: Optional[List[str]] = None) -> int:
+    """公开接口：在进程内检查单个文件，返回退出码（供 GUI 调用）。
+
+    sink 不为 None 时，报告文本会被追加到该列表而不是打印到 stdout。
+    """
+    import io
+    from pathlib import Path as _Path
+    p = _Path(path)
+    old = sys.stdout
+    buf = None
+    try:
+        if sink is not None:
+            buf = io.StringIO()
+            sys.stdout = buf
+        return main([str(p)] + (["--lint"] if lint else []) + ["--no-color"])
+    finally:
+        if buf is not None:
+            sys.stdout = old
+            sink.append(buf.getvalue())
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global S
     _init_console()

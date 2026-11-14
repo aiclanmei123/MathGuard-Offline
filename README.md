@@ -49,11 +49,16 @@
 
 ## 快速开始
 
-### 方式一：直接下 exe（无需 Python）
+### 方式一：图形界面（推荐，不碰命令行）
 
-1. 下载 [MathGuard-Windows-x64.zip](https://github.com/USERNAME/MathGuard-Offline/releases/latest)（37.8 MB）
+1. 下载 `MathGuard-Windows-x64.zip`（53.7 MB）
 2. 解压到任意位置
-3. 打开 cmd，cd 到该文件夹，运行：
+3. **双击 `MathGuard-GUI.exe`**
+4. 把 `.tex` 文件或整个论文文件夹**拖进窗口**，点【开始体检】
+
+结果会显示在窗口里，同时在论文旁边生成 `math_guard_report.txt`。
+
+### 方式二：命令行
 
 ```cmd
 math_guard.exe 你的论文.tex
@@ -65,11 +70,12 @@ math_guard.exe 你的论文.tex
 math_guard.exe example.tex
 ```
 
-### 方式二：从源码跑
+### 方式三：从源码跑
 
 ```bash
 pip install sympy
 python math_guard.py 你的论文.tex
+python math_guard_gui.py          # 图形界面
 ```
 
 可选增强（装了会做交叉校验，不装也能用）：

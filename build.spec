@@ -1,71 +1,78 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller 打包配置（onedir 模式）。
+"""PyInstaller 打包配置（onedir），产出两个 exe 共用一个 _internal 目录。
 
-为什么用 onedir 而不是 onefile：
-  onefile 每次运行都要把自己解压到临时目录。实测在本机出现
-  "[PYI-xxxxx:ERROR] Could not create temporary directory!" —— 在临时目录受限、
-  杀毒软件拦截、或用户目录带特殊字符的机器上很不可靠。
-  onedir 不做自解压，启动更快、兼容性更好，代价是「一个文件夹」而非「单个 exe」。
-  把整个文件夹压缩成 zip 发给别人即可，解压即用。
+产物目录 dist/math_guard/：
+    math_guard.exe        命令行版
+    MathGuard-GUI.exe     图形界面版（双击运行，拖拽即用）
+    example.tex           示例
+    _internal/            两个 exe 共用的运行库
+
+为什么用 onedir：onefile 每次运行都要解压到临时目录，实测在本机出现
+"Could not create temporary directory!"（临时目录受限/杀软拦截时不可靠）。
 """
+import os
+
 from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports = [
     "latex_macros",
-    "latexnav",          # 纯标准库单文件模块，带进去可增强结构检查
+    "latexnav",
     "sympy",
     "sympy.parsing.sympy_parser",
     "sympy.core",
     "sympy.functions",
     "sympy.simplify",
 ]
-hiddenimports += [m for m in collect_submodules("sympy") if ".tests" not in m]
+hiddenimports += [m for m in collect_submodules("sympy")
+                  if ".tests" not in m and not m.startswith("sympy.testing")]
+# GUI 版需要 tkinter（不能像旧配置那样排除）
+hiddenimports += ["tkinter", "tkinter.ttk", "tkinter.filedialog",
+                  "tkinter.messagebox", "tkinter.font"]
 
-a = Analysis(
+EXCLUDES = [
+    "parsub", "numpy", "scipy", "matplotlib", "pandas",
+    "openpyxl", "fastapi", "uvicorn", "starlette", "typer", "rich",
+    "IPython", "pytest", "PyQt5", "PySide2",
+    "mpmath.tests", "sympy.testing",
+]
+
+a1 = Analysis(
     ["math_guard.py"],
-    pathex=[],
-    binaries=[],
-    datas=[],
+    pathex=[os.getcwd()],
+    binaries=[], datas=[],
     hiddenimports=hiddenimports,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[
-        # 体积杀手：不打包科学计算全家桶（无 Python 机器上会自动降级为内置实现）
-        "parsub", "numpy", "scipy", "matplotlib", "pandas",
-        "openpyxl", "fastapi", "uvicorn", "starlette", "typer", "rich",
-        "IPython", "pytest", "tkinter", "PyQt5", "PySide2",
-        "mpmath.tests", "sympy.testing",
-    ],
-    noarchive=False,
-    optimize=0,
+    hookspath=[], hooksconfig={}, runtime_hooks=[],
+    excludes=EXCLUDES,
+    noarchive=False, optimize=0,
 )
-pyz = PYZ(a.pure)
+pyz1 = PYZ(a1.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="math_guard",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=True,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+exe_cli = EXE(pyz1, a1.scripts, [],
+              exclude_binaries=True,
+              name="math_guard",
+              console=True, debug=False, strip=False, upx=False,
+              bootloader_ignore_signals=False)
+
+a2 = Analysis(
+    ["math_guard_gui.py"],
+    pathex=[os.getcwd()],
+    binaries=[], datas=[],
+    hiddenimports=hiddenimports,
+    hookspath=[], hooksconfig={}, runtime_hooks=[],
+    excludes=EXCLUDES,
+    noarchive=False, optimize=0,
 )
+pyz2 = PYZ(a2.pure)
+
+exe_gui = EXE(pyz2, a2.scripts, [],
+              exclude_binaries=True,
+              name="MathGuard-GUI",
+              console=False, debug=False, strip=False, upx=False,
+              bootloader_ignore_signals=False)
 
 coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
+    exe_cli, a1.binaries, a1.datas,
+    exe_gui, a2.binaries, a2.datas,
+    strip=False, upx=False,
     name="math_guard",
 )
