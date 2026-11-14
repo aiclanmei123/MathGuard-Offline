@@ -321,6 +321,57 @@ def main() -> int:
         if not ok:
             fails.append(f"宏用例失败：{desc}")
 
+    print("\n[跨领域灰度测试暴露的缺陷（arXiv 几何/PDE）]")
+    BS3 = "\\"
+    # 缺陷 A：\varnothing / \emptyset 曾被映射成空串
+    #   arXiv:2611.15157 `TB_p(r)\cap\Sigma=\varnothing`
+    #   → sanitize 成 `A=` → 误判"关系符缺操作数"
+    # 缺陷 B：check_environments 没剥离注释
+    #   arXiv:2611.15796 注释里有 `%\begin{equation}` 和 `%end{equation}`（缺反斜杠）
+    #   → 误报"环境嵌套错序"
+    cross_cases = [
+        ("varnothing 不误报", "A=" + BS3 + "varnothing", "parsed"),
+        ("emptyset 不误报", "A=" + BS3 + "emptyset", "parsed"),
+        ("cap 与空集", "TB_p(r)" + BS3 + "cap" + BS3 + "Sigma=" + BS3 + "varnothing", "parsed"),
+    ]
+    for desc, latex, want in cross_cases:
+        d = m.verify_with_sympy(m.MathItem(kind="inline", line=1, latex=latex, original=latex))
+        ok = d.status == want
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:18} 预期={want} 实际={d.status}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {want}，实际 {d.status}")
+
+    # 注释里的环境不应参与配对检查
+    comment_tex = (
+        "\\documentclass{article}\n\\begin{document}\n"
+        "\\begin{proposition}\n"
+        "文本\n"
+        "%\\begin{equation}\\label{eq:x}\n"
+        "%   x = 1\n"
+        "%end{equation}\n"
+        "\\end{proposition}\n"
+        "\\end{document}\n"
+    )
+    tmpc = os.path.join(tempfile.gettempdir(), "_mg_comment_test.tex")
+    open(tmpc, "w", encoding="utf-8").write(comment_tex)
+    dc = m.read_tex(tmpc)
+    ec, _ = m.syntax_check(dc)
+    realc = [e for e in ec if "document" not in (e.message or "")]
+    ok = len(realc) == 0
+    passed += ok
+    failed += not ok
+    print(f"  {'PASS' if ok else 'FAIL'}  {'注释里的环境不误报':16} 预期=0 实际={len(realc)}")
+    if not ok:
+        fails.append(f"注释环境: 预期 0，实际 {len(realc)}")
+        for e in realc[:2]:
+            print(f"        L{e.line} {e.message[:60]}")
+    try:
+        os.remove(tmpc)
+    except OSError:
+        pass
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 

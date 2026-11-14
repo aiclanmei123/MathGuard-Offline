@@ -766,8 +766,12 @@ def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     verbatim / lstlisting 里的内容不参与（那里面的 \begin 是字面文本）。
     """
     issues: List[SyntaxIssue] = []
-    # 先把 verbatim 类环境内容抹掉，避免误判
-    scan = text
+    # ⚠ 必须先剥离注释！否则注释掉的 \begin{equation} 会被当成真实环境。
+    # 实证（arXiv:2611.15796 L1481-1486）：作者把一段 equation 注释掉，
+    # 其中 `%\begin{equation}` 与 `%end{equation}`（漏反斜杠）都在注释里，
+    # 不剥离注释就会误报"环境嵌套错序"。
+    scan = mask_comments(text)
+    # 再把 verbatim 类环境内容抹掉，避免误判
     for env in _VERBATIM_ENVS:
         scan = re.sub(r"\\begin\s*\{" + re.escape(env) + r"\}.*?\\end\s*\{" + re.escape(env) + r"\}",
                       lambda mm: " " * len(mm.group(0)), scan, flags=re.S)

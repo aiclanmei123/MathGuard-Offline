@@ -39,7 +39,12 @@ OPERATORS = {
     "Longrightarrow": "", "Longleftarrow": "", "Longleftrightarrow": "",
     "mapsto": "", "longmapsto": "", "gets": "",
     "cdots": "+", "ldots": "+", "dots": "+", "vdots": "+", "ddots": "+",
-    "infty": "oo", "infinity": "oo", "emptyset": "{}", "varnothing": "{}",
+    "infty": "oo", "infinity": "oo",
+    # 空集符号：必须映射成一个**占位符**，不能映射成空串。
+    # 实测 arXiv:2611.15157（微分几何）：`TB_p(r)\cap\Sigma=\varnothing`
+    # 若把 \varnothing 清成空串，式子变成 `A=`，会被误判为"关系符缺操作数"。
+    # 用 ∅（U+2205）保留一个操作数，判定走「仅可解析」。
+    "emptyset": "∅", "varnothing": "∅", "nothing": "∅",
 }
 
 # ===== 复杂结构：整条公式跳过（无法可靠符号化，硬塞只会产生幻觉）=====
