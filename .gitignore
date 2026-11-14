@@ -36,3 +36,7 @@ MathGuard-Windows-x64.zip
 
 # 一次性登录辅助脚本（含 client_id，不进仓库）
 github_device_login*.py
+
+# 发布过程笔记（含本机路径/公网 IP，不公开）
+PUBLISHING.md
+
