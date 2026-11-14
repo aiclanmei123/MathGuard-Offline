@@ -69,6 +69,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -2403,7 +2404,82 @@ def _check_pure_numeric(item: MathItem, parts: List[str], ops: List[str]) -> Che
                        relations=len(ops), critical=len(ops))
 
 
+def _verify_with_timeout(item: MathItem, timeout_s: float) -> CheckDetail:
+    """给单条公式的验证加**硬超时**，超时则优雅降级为「无法验证」。
+
+    为什么需要：sympy 遇到某些符号组合会疯狂化简，把 CPU 吃满。
+    实测（arXiv:2408.09776 的 \\sls 宏未展开时）单条公式跑了 4.4 秒，
+    整篇 5 分钟跑不完——在 GUI 里表现为「软件假死」。
+
+    Windows 没有 signal.alarm，改用「工作线程 + join 超时」。
+    超时后线程仍在后台跑（Python 无法强杀线程），但主流程立即继续，
+    用户永远不会被一条公式卡住。为防泄漏，同时限制并发超时线程数。
+    """
+    result: List[Optional[CheckDetail]] = [None]
+
+    def _run() -> None:
+        try:
+            result[0] = _verify_with_sympy_inner(item)
+        except BaseException:      # 线程内异常不能让主流程崩
+            result[0] = None
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(timeout_s)
+    if th.is_alive():
+        global _TIMEOUT_COUNT
+        _TIMEOUT_COUNT += 1
+        return CheckDetail(latex=item.latex, status="skip",
+                           reason=f"验证超时（>{timeout_s:g} 秒），已跳过以避免卡死",
+                           line=item.line, kind=item.kind)
+    if result[0] is None:
+        return CheckDetail(latex=item.latex, status="skip",
+                           reason="验证过程异常，已跳过",
+                           line=item.line, kind=item.kind)
+    return result[0]
+
+
+_TIMEOUT_COUNT = 0        # 本次运行里超时的公式条数（报告里会显示）
+_SYMPY_WARMED = False
+
+
+def _warm_up_sympy() -> None:
+    """预热 sympy：导入 + 构造一次解析器。
+
+    ⚠ 如果不预热，**第一次**调用 verify 会把 import sympy 的 ~700 ms
+    算进超时预算里，于是第一条公式（哪怕只是 `2+2=4`）会被误判成"超时"。
+    实测：阈值设 0.5 秒时，第一条普通公式花了 506 ms 直接熔断。
+    """
+    global _SYMPY_WARMED
+    if _SYMPY_WARMED:
+        return
+    _SYMPY_WARMED = True
+    try:
+        sympy_mod, _ = _sympy_available()
+        if sympy_mod is None:
+            return
+        _parse_expr(sympy_mod, "1+1=2")
+    except Exception:
+        pass
+
+
 def verify_with_sympy(item: MathItem) -> CheckDetail:
+    """对外入口：带超时保护的验证。
+
+    超时时间可用环境变量 MATH_GUARD_TIMEOUT 调整（秒，默认 3）。
+    实测正常公式 99% 在 50 ms 内完成，3 秒足够宽松。
+    """
+    _warm_up_sympy()
+    try:
+        limit = float(os.environ.get("MATH_GUARD_TIMEOUT", "3"))
+    except Exception:
+        limit = 3.0
+    if limit <= 0:
+        return _verify_with_sympy_inner(item)
+    return _verify_with_timeout(item, limit)
+
+
+def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
     try:
         sympy, _ = _sympy_available()
         if sympy is None:

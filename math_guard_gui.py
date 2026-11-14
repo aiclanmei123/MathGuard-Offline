@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import sys
 import threading
 import traceback
@@ -29,6 +30,98 @@ from tkinter import filedialog, messagebox, ttk
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
+
+
+# ---------------- 打开编辑器并定位到行 ----------------
+# 用户看到 "sec7_Sn.tex:145" 之后，最想要的是**点一下就跳过去**，
+# 而不是自己去找文件翻行号。这里按优先级尝试常见编辑器。
+_EDITOR_CACHE: Optional[list] = None
+
+
+def _find_editors() -> list:
+    """返回可用的 (名称, 启动命令模板) 列表，按优先级排序。
+
+    模板里的 {file} / {line} 会被替换。
+    """
+    import shutil as _sh
+    found = []
+
+    def _add(name, exe, make_args):
+        if exe and os.path.exists(exe):
+            found.append((name, make_args(exe)))
+
+    # VS Code：命令行版优先，其次常见安装路径
+    vscode_cmd = _sh.which("code") or _sh.which("code.cmd")
+    if vscode_cmd:
+        found.append(("VS Code", lambda f, l, e=vscode_cmd: [e, "-g", f"{f}:{l}"]))
+    for p in (
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"),
+        os.path.expandvars(r"%ProgramFiles%\Microsoft VS Code\Code.exe"),
+    ):
+        if os.path.exists(p):
+            found.append(("VS Code", lambda f, l, e=p: [e, "-g", f"{f}:{l}"]))
+            break
+
+    # Notepad++：-n<line>
+    for p in (
+        _sh.which("notepad++"),
+        os.path.expandvars(r"%ProgramFiles%\Notepad++\notepad++.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Notepad++\notepad++.exe"),
+    ):
+        if p and os.path.exists(p):
+            found.append(("Notepad++", lambda f, l, e=p: [e, f"-n{l}", f]))
+            break
+
+    # Sublime Text：file:line
+    for p in (
+        _sh.which("subl"),
+        os.path.expandvars(r"%ProgramFiles%\Sublime Text\sublime_text.exe"),
+    ):
+        if p and os.path.exists(p):
+            found.append(("Sublime", lambda f, l, e=p: [e, f"{f}:{l}"]))
+            break
+
+    # TeXstudio / WinEdt（中文用户常见）
+    for p, name, mk in (
+        (os.path.expandvars(r"%ProgramFiles%\texstudio\texstudio.exe"), "TeXstudio",
+         lambda f, l, e=None: [e, f"-l{l}", f]),
+        (os.path.expandvars(r"%ProgramFiles%\WinEdt Team\WinEdt 11\WinEdt.exe"), "WinEdt",
+         lambda f, l, e=None: [e, f"[Open('{f}:{l}')]"]),
+    ):
+        if os.path.exists(p):
+            found.append((name, lambda f, l, e=p, m=mk: m(f, l, e)))
+            break
+
+    # 兜底：记事本（至少能打开文件）
+    found.append(("记事本", lambda f, l: ["notepad.exe", f]))
+    return found
+
+
+def available_editors() -> list:
+    global _EDITOR_CACHE
+    if _EDITOR_CACHE is None:
+        try:
+            _EDITOR_CACHE = _find_editors()
+        except Exception:
+            _EDITOR_CACHE = [("记事本", lambda f, l: ["notepad.exe", f])]
+    return _EDITOR_CACHE
+
+
+def open_in_editor(file_path: str, line: int = 1) -> tuple:
+    """用优先级最高的可用编辑器打开文件并定位到行。返回 (是否成功, 说明)。"""
+    import subprocess as _sp
+    editors = available_editors()
+    last_err = ""
+    for name, maker in editors:
+        try:
+            cmd = maker(file_path, max(1, int(line)))
+            _sp.Popen(cmd, close_fds=True)
+            return True, name
+        except Exception as exc:
+            last_err = f"{name}: {exc}"
+            continue
+    return False, last_err or "没有可用的编辑器"
+
 
 try:
     import math_guard as mg
@@ -86,6 +179,7 @@ class App:
         self.paths: List[Path] = []
         self.queue: "queue.Queue[tuple]" = queue.Queue()
         self.running = False
+        self._stop_flag = False
         self.drop = DropTarget(root, self.on_drop)
 
         root.title(APP_TITLE)
@@ -130,6 +224,9 @@ class App:
         ttk.Button(btns, text="选择文件夹", command=self.choose_dir).pack(side="left", padx=6)
         self.run_btn = ttk.Button(btns, text="开始体检", command=self.start_check)
         self.run_btn.pack(side="left", padx=(18, 0))
+        self.stop_btn = ttk.Button(btns, text="停止", command=self.stop_check,
+                                   state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
         ttk.Button(btns, text="清空", command=self.clear).pack(side="left", padx=6)
 
         self.lint_var = tk.BooleanVar(value=False)
@@ -150,7 +247,7 @@ class App:
         frame = tk.Frame(body, bg="#f5f6f8")
         frame.pack(fill="both", expand=True)
         self.text = tk.Text(frame, wrap="none", font=("Consolas", 9), bg="white",
-                            bd=1, relief="sunken")
+                            bd=1, relief="sunken", cursor="arrow")
         vs = ttk.Scrollbar(frame, orient="vertical", command=self.text.yview)
         hs = ttk.Scrollbar(frame, orient="horizontal", command=self.text.xview)
         self.text.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
@@ -160,7 +257,76 @@ class App:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
-    # ---------------- 交互 ----------------
+        # 可点击的「文件:行号」：点一下直接用编辑器打开并定位
+        self.text.tag_configure("loc", foreground="#1a5fb4", underline=True)
+        self.text.tag_bind("loc", "<Enter>",
+                           lambda e: self.text.configure(cursor="hand2"))
+        self.text.tag_bind("loc", "<Leave>",
+                           lambda e: self.text.configure(cursor="arrow"))
+        self.text.tag_bind("loc", "<Button-1>", self._on_loc_click)
+
+    def _on_loc_click(self, event) -> None:
+        """点击「文件:行号」时用编辑器打开定位。"""
+        try:
+            idx = self.text.index(f"@{event.x},{event.y}")
+            ranges = self.text.tag_ranges("loc")
+            target = None
+            for i in range(0, len(ranges), 2):
+                s, e = str(ranges[i]), str(ranges[i + 1])
+                if (self.text.compare(s, "<=", idx)
+                        and self.text.compare(idx, "<", e)):
+                    target = self.text.get(s, e)
+                    break
+            if not target:
+                return
+            path, line = self._resolve_loc(target)
+            if not path:
+                messagebox.showinfo("无法定位", f"找不到文件：{target}")
+                return
+            ok, how = open_in_editor(str(path), line)
+            if ok:
+                self.text.insert("end", f"\n[已用 {how} 打开] {path}:{line}\n")
+                self.text.see("end")
+            else:
+                messagebox.showwarning("打开失败", f"无法打开编辑器：{how}")
+        except Exception as exc:
+            messagebox.showwarning("打开失败", str(exc))
+
+    def _resolve_loc(self, token: str):
+        """把 "文件名:行号" 解析成绝对路径 + 行号。
+
+        报告里的位置可能是：
+          · 完整路径 C:\\...\\main.tex:145
+          · 相对路径 sec7_Sn.tex:145（多文件展开时）
+          · 只有行号 L559
+        前两种要结合当前选择的目录去找文件。
+        """
+        token = token.strip()
+        m_ = re.match(r"^(.*?):(\d+)$", token)
+        if not m_:
+            return None, 0
+        raw_path, line = m_.group(1), int(m_.group(2))
+
+        cand = Path(raw_path)
+        if cand.is_file():
+            return cand, line
+
+        # 相对路径：在用户选中的路径里找同名文件
+        name = Path(raw_path).name
+        roots = [p if p.is_dir() else p.parent for p in self.paths]
+        for root in roots:
+            direct = root / name
+            if direct.is_file():
+                return direct, line
+            try:
+                for dp, _, fns in os.walk(root):
+                    if name in fns:
+                        return Path(dp) / name, line
+            except OSError:
+                continue
+        return None, 0
+
+
     def choose_files(self) -> None:
         files = filedialog.askopenfilenames(
             title="选择要体检的 .tex 文件",
@@ -207,7 +373,9 @@ class App:
             messagebox.showinfo("提示", "请先拖入 .tex 文件或文件夹")
             return
         self.running = True
+        self._stop_flag = False
         self.run_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
         self.text.delete("1.0", "end")
         self.verdict.configure(text="正在体检…", fg="#2b6cb0")
         # ⚠ tkinter 变量只能主线程读：子线程里调 lint_var.get() 会抛
@@ -217,6 +385,12 @@ class App:
         #   必须在启动线程**之前**把值取出来传进去。
         lint = bool(self.lint_var.get())
         threading.Thread(target=self._work, args=(lint,), daemon=True).start()
+
+    def stop_check(self) -> None:
+        """请求停止：后台线程在每个文件开始前检查这个标志。"""
+        if self.running:
+            self._stop_flag = True
+            self.verdict.configure(text="正在停止…", fg="#b7791f")
 
     def _work(self, lint: bool) -> None:
         try:
@@ -238,6 +412,9 @@ class App:
         self.queue.put(("log", f"共 {len(files)} 个文件，开始体检…\n", None))
         results = []
         for i, f in enumerate(files, 1):
+            if self._stop_flag:
+                self.queue.put(("log", f"\n（已在第 {i} 个文件处手动停止）\n", None))
+                break
             buf: List[str] = []
             try:
                 code = mg.check_single(f, lint=lint, sink=buf)
@@ -296,14 +473,49 @@ class App:
                     color = item[2] if len(item) > 2 else "#2d3748"
                     body = item[3] if len(item) > 3 else ""
                     self.verdict.configure(text=verdict, fg=color)
-                    self.text.insert("1.0", body)
+                    self._insert_report(body)
                     if body:
                         self._save_report(body)
                     self.running = False
                     self.run_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
         except queue.Empty:
             pass
         self.root.after(120, self._poll_queue)
+
+    def _insert_report(self, body: str) -> None:
+        """插入报告，并把其中的「文件:行号」标成可点击。"""
+        self.text.delete("1.0", "end")
+        if not body:
+            return
+        self.text.insert("1.0", body)
+        # 匹配形如 xxx.tex:123 的位置。
+        # ⚠ 索引换算：Tk 的 "1.0 + N c" 是**字符偏移**（count 属性要显式给 "c"），
+        #   写成 "1.0+Nc" 会被当成「行.列」解析，导致一个都标不上。
+        #   用 text.search 按正则直接定位并打 tag 最可靠。
+        try:
+            start = "1.0"
+            while True:
+                pos = self.text.search(r"[\w\-.\\/]+\.tex:\d+", start,
+                                       stopindex="end", regexp=True)
+                if not pos:
+                    break
+                # pos 是匹配起点。长度用正则重新量，不能用 lineend（会吞掉整行）。
+                tail = self.text.get(pos, "end")
+                mm = re.match(r"[\w\-.\\/]+\.tex:\d+", tail)
+                if not mm:
+                    break
+                token = mm.group(0)
+                s = self.text.index(pos)
+                e = self.text.index(f"{pos}+{len(token)}c")
+                self.text.tag_add("loc", s, e)
+                start = e
+        except Exception as exc:
+            import traceback as _tb
+            try:
+                self.text.insert("end", f"\n[定位标记失败: {exc}]\n{_tb.format_exc()}\n")
+            except Exception:
+                pass
 
     def _save_report(self, body: str) -> None:
         try:
