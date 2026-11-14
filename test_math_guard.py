@@ -263,6 +263,40 @@ def main() -> int:
         except OSError:
             pass
 
+    print("\n[实战回归：Apery 论文定稿 PDF 里真实印出来的空分母]")
+    # 这一段是从 Apery_midpoint_congruences_final.pdf 第 38 页公式 (7.16) 抄回来的。
+    # 该 PDF 已定稿，但公式右侧的分式分母是空的，渲染出来是一道空横线。
+    # 原始 LaTeX（sec7_Sn.tex:145）：
+    #   {}_{2}F_{1}\Bigl(\hf,\hf;1;4e^{x}(1-e^{x})\Bigr)
+    #     =(2e^{x}-1)^{-1}{}_{2}F_{1}\Bigl(\hf,\hf;1;\frac{-(e^{-x}-1)^{2}}{}\Bigr)
+    real_world = [
+        ("PDF 第38页空分母",
+         "{}_{2}F_{1}" + BS + "Bigl(" + BS + "hf," + BS + "hf;1;4e^{x}(1-e^{x})" + BS + "Bigr)"
+         "=(2e^{x}-1)^{-1}{}_{2}F_{1}" + BS + "Bigl(" + BS + "hf," + BS + "hf;1;"
+         + BS + "frac{-(e^{-x}-1)^{2}}{}" + BS + "Bigr)", 1),
+        ("sec5_exp 空二项式", BS + "binom{}{}=0", 2),
+        ("sec9_tower 占位残骸", BS + "frac{" + BS + "cdot}{}", 2),
+        ("zagier 占位残骸", BS + "int" + BS + "frac{" + BS + "cdot}{1-x}", 1),
+        ("zagier 待填草稿", BS + "frac{" + BS + "ldots}{m-a}", 1),
+    ]
+    for desc, body, expect_n in real_world:
+        text = "\\documentclass{article}\n\\begin{document}\n$" + body + "$\n\\end{document}\n"
+        tmpf = os.path.join(tempfile.gettempdir(), "_mg_real_test.tex")
+        open(tmpf, "w", encoding="utf-8").write(text)
+        d = m.read_tex(tmpf)
+        es, _ = m.syntax_check(d)
+        real = [x for x in es if x.kind in ("empty-arg", "placeholder-arg")]
+        ok = len(real) == expect_n
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:20} 预期={expect_n} 实际={len(real)}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {expect_n}，实际 {len(real)}")
+        try:
+            os.remove(tmpf)
+        except OSError:
+            pass
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 

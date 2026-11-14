@@ -2422,13 +2422,13 @@ def build_report(info_file: FileInfo, structure: StructureReport, formulas: Mock
     # 语法层检查（模块三 / 七）
     syn = getattr(structure, "syntax_errors", []) or []
     if syn:
-        add(f"  {S.RED}语法问题       : {len(syn)} 处（环境/括号未配对，会导致编译失败）{S.RESET}")
+        add(f"  {S.RED}语法问题       : {len(syn)} 处（括号/环境未配对，或必填参数为空）{S.RESET}")
     else:
         add(f"  语法问题       : {S.GREEN}0 处（环境与括号均配对）{S.RESET}")
     add("")
 
     if syn:
-        add(f"  {S.RED}▲ 语法错误（LaTeX 会直接编译失败）{S.RESET}")
+        add(f"  {S.RED}▲ 语法错误（确定的笔误，必须修）{S.RESET}")
         for e in syn[:max_detail]:
             loc = f"{e.file}:{e.line}" if e.file else f"L{e.line}"
             add(f"    {loc:<24} {e.message}")
