@@ -661,10 +661,21 @@ _RELATION_FRAGMENT_RE = re.compile(
 
 # 1) 勒让德/雅可比符号：\left(\frac{a}{p}\right) 是「a 是否为二次剩余」的记号，
 #    不是把 a 除以 p。实测 $(5/11)=1$ 被误判为 5/11=1，是典型假阳性。
-_LEGENDRE_RE = re.compile(r"\\left\s*\(\s*\\frac\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\\right\s*\)")
+#    ⚠ 定界符不止 \left/\right：\bigl/\bigr、Bigl/Bigr、biggl/biggr 同样常见。
+#      实证（arXiv:2611.16130）：\bigl(\tfrac{3}{7}\bigr)=-1
+#      只认 \left 会漏掉整类写法，误判成 3/7 = -1。
+_LEGENDRE_RE = re.compile(
+    r"\\(?:left|bigl|Bigl|biggl|Biggl)\s*\("
+    r"\s*\\[dt]?frac\s*\{[^{}]*\}\s*\{[^{}]*\}"
+    r"\s*\\(?:right|bigr|Bigr|biggr|Biggr)\s*\)")
 
 # 2) 导数记号说明：{ }'=d/d\tau、f'=df/dx 之类，是"定义"而不是数值断言
-_DERIV_NOTATION_RE = re.compile(r"(?:\{\s*\}|['′])\s*=\s*(?:d\s*/|\\mathrm\{d\}|\\partial)")
+#    ⚠ 还有一类：行内公式「跨进正文」，等号右边根本没有数学内容：
+#      \(f' =\) restriction of the modular form \(f\) ...
+#    实证（arXiv:2611.16909）：$f' =$ 被误判为"缺操作数"。
+#    判据：撇号后紧跟 =、且 = 之后为空 → 是在给符号作说明，不是在断言等式。
+_DERIV_NOTATION_RE = re.compile(
+    r"(?:\{\s*\}|['′])\s*=\s*(?:d\s*/|\\mathrm\{d\}|\\partial)|['′]\s*=\s*$")
 
 # 3) 上下文中出现"取模 p^k / mod"时，普通等号可能是模意义下的近似写法。
 #    实测原文 "(70^3)/125=2744/5 ... 取模 1331" 被误判为 2744 = 2744/5。
@@ -763,6 +774,83 @@ def _blank_macro_definitions(text: str) -> str:
     return "".join(out)
 
 
+def _blank_environment_definitions(text: str) -> str:
+    r"""把 \newenvironment{name}{begin}{end} 的定义体替换成等长空格。
+
+    \newenvironment 的第二个、第三个参数是「环境体」，
+    里面出现的 \begin{...} / \end{...} 和花括号是**定义内容**，
+    不是文档里真实的环境嵌套。
+
+    实证：
+      · arXiv:2611.17210
+          \newenvironment{obs}[1][]{\ifx\relax#1\relax\begin{obswr}
+            \else\begin{obswr}[#1]\fi\begin{upshape}...}
+        → 不剥离会误报 "obswr 没有对应的 \end{obswr}"
+      · arXiv:2611.16819
+          \newenvironment{psmallmatrix}
+            {\left(\begin{smallmatrix}}
+            {\end{smallmatrix}\right)}
+        → 不剥离会误报 "多余的右花括号 }"
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    pat = re.compile(r"\\newenvironment\*?\s*\{[^{}]*\}")
+    while True:
+        m = pat.search(text, i)
+        if not m:
+            break
+        j = m.end()
+        # 跳过可选的 [nargs] 与 [default]
+        while j < n and text[j] in " \t\n":
+            j += 1
+        while j < n and text[j] == "[":
+            depth_b = 1
+            j += 1
+            while j < n and depth_b:
+                if text[j] == "[":
+                    depth_b += 1
+                elif text[j] == "]":
+                    depth_b -= 1
+                j += 1
+            while j < n and text[j] in " \t\n":
+                j += 1
+        # 依次吞掉接下来的 {...} 体（begin 体、end 体）
+        consumed_any = False
+        for _ in range(2):
+            while j < n and text[j] in " \t\n":
+                j += 1
+            if j >= n or text[j] != "{":
+                break
+            depth, k = 0, j
+            while k < n:
+                c = text[k]
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if k >= n:
+                break
+            for p in range(j, k + 1):
+                if text[p] != "\n":
+                    out[p] = " "
+            consumed_any = True
+            j = k + 1
+        if consumed_any:
+            for p in range(m.start(), m.end()):
+                if text[p] != "\n":
+                    out[p] = " "
+            i = j
+        else:
+            i = m.end()
+    return "".join(out)
+
+
 def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     r"""模块三：\begin{xxx} 与 \end{xxx} 是否配对。
 
@@ -785,6 +873,15 @@ def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
         scan = re.sub(r"\\begin\s*\{" + re.escape(env) + r"\}.*?\\end\s*\{" + re.escape(env) + r"\}",
                       lambda mm: " " * len(mm.group(0)), scan, flags=re.S)
     scan = _blank_macro_definitions(scan)
+    # \newenvironment{name}{begin-body}{end-body} 的**两个体**里同样会写
+    # \begin{...}/\end{...}，那是环境定义，不是真实嵌套。
+    # 实证（arXiv:2611.17210）：
+    #   \newenvironment{obs}[1][]{\begin{obswr}...\end{obswr}}
+    # 不剥离就会误报"obswr 没有对应的 \end{obswr}"。
+    # 实证（arXiv:2611.16819）：
+    #   \newenvironment{psmallmatrix}{\left(\begin{smallmatrix}}{\end{smallmatrix}\right)}
+    # 会被误报"多余的右花括号 }"。
+    scan = _blank_environment_definitions(scan)
     # CJK 风格环境（\begin{CJK*}{GBK}{song} ... \end{CJK*}）会横跨整篇文档，
     # 里面嵌套 proof/theorem 完全是合法的。这类「壳环境」不参与配对检查。
     _SHELL_ENVS = {"CJK", "CJK*", "CJKutf8", "document", "otherlanguage", "otherlanguage*"}
@@ -863,6 +960,11 @@ def check_braces(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     # 实测 ArtMathResearch.tex 用 \def\({ \left(} 重定义定界符，会被误报。
     scan = re.sub(r"\\(?:def|gdef|edef|xdef)\s*\\(?:[A-Za-z]+|.)\s*\{[^{}]*\}",
                   lambda mm: " " * len(mm.group(0)), scan)
+    # \newenvironment 的两个体里的花括号同样是定义内容，不是真实使用。
+    # 实证（arXiv:2611.16819）：
+    #   \newenvironment{psmallmatrix}{\left(\begin{smallmatrix}}{\end{smallmatrix}\right)}
+    # 不剥离会误报"多余的右花括号 }"。
+    scan = _blank_environment_definitions(scan)
 
     stack: List[Tuple[str, int]] = []
     i, n = 0, len(scan)
@@ -1944,11 +2046,32 @@ def _restore_length(sanitized: str) -> str:
     # 单字符上标：基底 + ^ + 空格 + 单个数字
     _pow_caret = re.compile(r"([A-Za-z0-9)]) ?\^ ?(\d)")
 
+    # ⚠ 上标内容是**表达式**而非纯数字：2^{4-1}、10^{3-2}。
+    #   抹掉花括号后：
+    #       2^{4-1}=8  -> '2^ 4-1 =8'     （4-1 后面是空格 = 原花括号闭合处）
+    #       2^{2}-1=3  -> '2^ 2 -1=3'     （2 后面有空格，-1 在花括号**外**）
+    #   因此用「内部不能出现空格」来锁定花括号内的表达式。
+    #   注意：末尾的负向断言**不能禁空格**——花括号闭合处本来就会留下空格；
+    #   只禁数字和小数点即可，避免把 "2^{2}-1" 里的 "-1" 吃进指数。
+    #   实证（arXiv:2611.16254）：$2^{4-1}=8$ 曾被误判成 15=8。
+    _pow_expr = re.compile(
+        r"([A-Za-z0-9)])\s*\^\s*(\d+(?:[+\-*/]\d+)+)(?![0-9.])")
+
+    def _sub_pow_expr(m: "re.Match[str]") -> str:
+        base, expr = m.group(1), m.group(2)
+        span_len = len(m.group(0))
+        head = base + "**("
+        body = expr + ")"
+        pad = span_len - len(head) - len(body)
+        return head + body + " " * max(0, pad)
+
     def _sub_pow(m: "re.Match[str]") -> str:
         base, gap, digits = m.group(1), m.group(2), m.group(3)
         # ** 紧贴基底，多余空白留在数字之前；总长度与原片段相等
         return base + "**" + " " * (len(gap) - 2) + digits
 
+    # 先处理表达式上标（更长，避免被 _pow_braced 先吃掉前导数字）
+    work = _pow_expr.sub(_sub_pow_expr, work)
     work = _pow_braced.sub(_sub_pow, work)
 
     # 单字符上标（清理后仍带 ^）：x^2 / x^ 2 / x ^ 2 -> x**2，长度保持不变
@@ -2209,6 +2332,22 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
 
         compact_parts = [re.sub(r"\s+", "", p) for p in parts]
         if ops and any(p == "" for p in compact_parts):
+            # 0) align/gather 里 `A\ge` + `\\` + `&\ge B` 这种断行：
+            #    换行符与对齐符把两个关系符粘在一起，中间夹了个空操作数。
+            #    实证（arXiv:2611.16828）：整段 align* 因此被判"缺操作数"。
+            #    判据：原文含 align/gather 类环境或 `&`，且空段两侧都是关系符。
+            if re.search(r"&|\\\\", item.original):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="多行对齐公式的断行处（& 或 \\\\），非笔误",
+                                   line=item.line, kind=item.kind)
+            # 0b) 上标里是**装饰符号**而非关系符：(-)^{\sim}、A^{\sim}、f^{\prime}
+            #    \sim 被映射成 ∼ 后会被 _REL_RE 当成关系符，把式子切成 `(-)^` + 空。
+            #    实证（arXiv:2611.17210）：$(-)^{\sim}$ 表示"反射包"，被误判缺操作数。
+            if re.search(r"\^\s*\{\s*\\(?:sim|approx|simeq|cong|prime|ast|dagger|star)\s*\}", item.latex) \
+                    or re.search(r"\^\s*\\(?:sim|prime|ast|dagger|star)(?![A-Za-z])", item.latex):
+                return CheckDetail(latex=item.latex, status="parsed",
+                                   reason="上标是装饰符号（\\sim、\\prime 等），非关系断言",
+                                   line=item.line, kind=item.kind)
             # 1) 「排版用的关系式片段」：如 $=$、$+$、$\ge5$，孤立的 = 不是笔误。
             #    判据：整个公式**没有任何字母/变量**（只有符号和至多一个数字）才算。
             #    "x =" 里有字母 x，那是真笔误，必须继续往下判。

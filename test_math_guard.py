@@ -475,6 +475,56 @@ def main() -> int:
     import shutil as _sh
     _sh.rmtree(bdir, ignore_errors=True)
 
+    print("\n[数论论文暴露的缺陷（arXiv math.NT 24 篇）]")
+    BS5 = "\\"
+    ntl_cases = [
+        # 勒让德符号：\bigl(...\bigr) 形式（此前只认 \left...\right）
+        ("bigl 勒让德符号", BS5 + "bigl(" + BS5 + "tfrac{3}{7}" + BS5 + "bigr)=-1", "parsed"),
+        ("left 勒让德符号", BS5 + "left(" + BS5 + "frac{5}{11}" + BS5 + "right)=1", "parsed"),
+        # 上标表达式：2^{4-1} 曾是 2**4-1 = 15
+        ("上标含表达式", "2^{4-1}=8", "ok"),
+        ("上标表达式+外减", "2^{2}-1=3", "ok"),
+        ("上标表达式错误", "2^{4-1}=9", "error"),
+        # 装饰上标：(-)^{\sim} 的 \sim 被当关系符
+        ("装饰上标 sim", "(-)^{" + BS5 + "sim}", "parsed"),
+        ("上标 prime", "A^{" + BS5 + "prime}", "parsed"),
+    ]
+    for desc, latex, want in ntl_cases:
+        d = m.verify_with_sympy(m.MathItem(kind="inline", line=1, latex=latex, original=latex))
+        ok = d.status == want
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:18} 预期={want} 实际={d.status}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {want}，实际 {d.status}")
+
+    # \newenvironment 定义体里的 \begin/\end 不应参与配对检查
+    ne_tex = (
+        "\\documentclass{article}\n\\begin{document}\n"
+        "\\newenvironment{psmallmatrix}{\\left(\\begin{smallmatrix}}"
+        "{\\end{smallmatrix}\\right)}\n"
+        "\\newenvironment{obs}[1][]{\\begin{obswr}x\\end{obswr}}\n"
+        "\\begin{equation}a=b\\end{equation}\n"
+        "\\end{document}\n"
+    )
+    tmpn = os.path.join(tempfile.gettempdir(), "_mg_newenv_test.tex")
+    open(tmpn, "w", encoding="utf-8").write(ne_tex)
+    dn = m.read_tex(tmpn)
+    en, _ = m.syntax_check(dn)
+    realn = [e for e in en if "document" not in (e.message or "")]
+    ok = len(realn) == 0
+    passed += ok
+    failed += not ok
+    print(f"  {'PASS' if ok else 'FAIL'}  {'newenvironment 不误报':16} 预期=0 实际={len(realn)}")
+    if not ok:
+        fails.append(f"newenvironment: 预期 0，实际 {len(realn)}")
+        for e in realn[:2]:
+            print(f"        L{e.line} {e.message[:60]}")
+    try:
+        os.remove(tmpn)
+    except OSError:
+        pass
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 
