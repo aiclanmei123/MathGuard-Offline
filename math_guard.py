@@ -459,7 +459,7 @@ _VERBATIM_RE = re.compile(
 
 # \newcommand{\name}[n]{body} / \renewcommand ... —— 老论文大量依赖自定义宏
 _NEWCMD_RE = re.compile(
-    r"\\(?:newcommand|renewcommand|providecommand)\*?\s*"
+    r"\\(newcommand|renewcommand|providecommand)\*?\s*"
     r"(?:\{\s*\\([A-Za-z]+)\s*\}|\\\\([A-Za-z]+))\s*"
     r"(?:\[(\d)\]\s*)?"
     r"(?:\[[^\]]*\]\s*)?"
@@ -508,12 +508,21 @@ def collect_macros(text: str) -> Dict[str, Tuple[int, str]]:
         return None
 
     # ---- 1) \newcommand / \renewcommand / \providecommand ----
+    # ⚠ 语义区别（实测 arXiv:2611.16739）：
+    #     \providecommand{\C}{}          只在未定义时生效 → 空
+    #     \renewcommand{\C}{\mathbb{C}}  强制覆盖        → \mathbb{C}
+    #   若一律"先定义先得"，会保留 L28 的空定义，导致 `\mathbb F=\C`
+    #   展开成 `F=`，误判为笔误。因此 renewcommand 必须覆盖。
     for m in _NEWCMD_RE.finditer(text):
-        name = m.group(1) or m.group(2)
-        nargs = int(m.group(3) or 0)
+        cmd = m.group(1)            # newcommand / renewcommand / providecommand
+        name = m.group(2) or m.group(3)
+        nargs = int(m.group(4) or 0)
         body = _body_from(m.end() - 1)
-        if body is not None and name and name not in macros:
+        if body is None or not name:
+            continue
+        if cmd == "renewcommand" or name not in macros:
             macros[name] = (nargs, body)
+        # providecommand：已存在则保持原值（与 LaTeX 语义一致）
 
     # ---- 2) \def\name#1#2{...} / \def\name{...} ----
     for m in _DEF_RE.finditer(text):
@@ -1743,10 +1752,47 @@ def _brace_bare_args(src: str) -> str:
     return src
 
 
+def _unwrap_font_wrappers(latex: str) -> str:
+    r"""把 \mathbb{X} / \mathcal{X} / \mathit{X} 这类**字体包装**还原成 X。
+
+    为什么需要：字体命令只改变字形，**不改变数学含义**：
+        \mathbb F = \mathbb R   →   F = R
+        \mathcal{M}             →   M
+    若把命令名连同参数一起清掉，`\mathbb F=\mathbb R` 会变成 `F=`，
+    被误判为"关系符缺操作数"。
+
+    实证（arXiv:2611.16739，随机矩阵）正文：
+        and we denote by $O(p)$ ... when $\mathbb F=\mathbb R$
+    该文件还有 \renewcommand{\C}{\mathbb{C}} —— 字体包装在论文里极其常见。
+
+    只处理**纯样式**命令白名单。\text、\operatorname、\overline、\sqrt
+    等语义不同，不动。
+    """
+    sim = ("mathbb", "mathcal", "mathbf", "mathit", "mathsf", "mathtt",
+           "mathfrak", "mathscr", "boldsymbol", "bm", "mathnormal")
+    alt = "|".join(sim)
+    for _ in range(3):
+        # 带花括号：\mathbb{F} -> F
+        new = re.sub(r"\\(" + alt + r")\s*\{([^{}]*)\}", lambda mo: mo.group(2), latex)
+        # 单 token：\mathbb F -> F
+        # ⚠ 必须用否定前瞻排除「紧跟字母」的情况，否则 `\mathbb C` 里的 C
+        #   会被前面 `\mathbb` 本身的字母吃掉，剥成 " mathbb"。
+        new = re.sub(r"\\(" + alt + r")\s*(\\[A-Za-z]+|(?![A-Za-z])[A-Za-z0-9])",
+                     lambda mo: mo.group(1), new)
+        if new == latex:
+            break
+        latex = new
+    return latex
+
+
 def sanitize_latex(src: str) -> str:
     # ⚠ 性能要点：这里绝不能用「多次 re.sub 重建字符串」的写法——每次 re.sub 都会
     # 扫描整条公式，嵌套 200 层的 \\frac{...}{...} 会退化成 O(n^2)，把体检工具自己卡死。
     # 因此所有步骤合并成一次「逐字符扫描」，保证 O(n)。
+    # 唯一例外：字体包装（\mathbb{X}）在进入扫描前统一剥掉——它是纯样式，
+    # 不剥会让 `\mathbb F=\mathbb R` 变成 `F=` 而误报。该函数只做少量 re.sub，
+    # 且只对本就含这些命令的公式生效，实测不影响性能。
+    src = _unwrap_font_wrappers(src)
     out: List[str] = []
     i, n = 0, len(src)
     while i < n:
@@ -2222,6 +2268,16 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
                     r"(?:[=<>&\+-]|\\equiv|\\le|\\leq|\\ge|\\geq|\\neq|\\ne|\\approx)\s*$", stripped):
                 return CheckDetail(latex=item.latex, status="skip",
                                    reason="多行公式的续行（以关系符结尾），非完整公式",
+                                   line=item.line, kind=item.kind)
+            # 6) 「关系符号本身作为一条公式」：概率论里 $\eqd$ 展开后是
+            #    \overset{d}{=}（依分布相等），常被单独写在两式之间，
+            #    此时 = 两侧都空是**正常用法**，不是笔误。
+            #    实证（arXiv:2611.17234，first-passage percolation）：
+            #      \newcommand{\eqd}{\overset{d}{=}}  然后写成  $X_n \eqd N(0,1)$
+            if re.fullmatch(r"\s*\\overset\s*\{[^{}]*\}\s*\{[^{}]*\}\s*", item.latex) \
+                    or re.fullmatch(r"\s*\\stackrel\s*\{[^{}]*\}\s*\{[^{}]*\}\s*", item.latex):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="关系符号本身（如 \\overset{d}{=} 依分布相等），非完整公式",
                                    line=item.line, kind=item.kind)
             return CheckDetail(latex=item.latex, status="error",
                                reason="关系符缺少一侧操作数，疑似笔误",

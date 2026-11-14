@@ -372,6 +372,40 @@ def main() -> int:
     except OSError:
         pass
 
+    print("\n[概率论论文暴露的缺陷（arXiv math.PR）]")
+    BS4 = "\\"
+    # 缺陷 C：字体包装 \mathbb{X} 曾把参数内容丢掉
+    #   arXiv:2611.16739 `\mathbb F=\mathbb R` → `F=` → 误报缺操作数
+    # 缺陷 D：\providecommand{\C}{} 与 \renewcommand{\C}{\mathbb{C}} 并存时，
+    #   "先定义先得"保留了空定义
+    # 缺陷 E：\overset{d}{=}（依分布相等）作为独立公式被误判
+    font_cases = [
+        ("mathbb 单 token", BS4 + "mathbb F=" + BS4 + "mathbb R", "parsed"),
+        ("mathbb 花括号", BS4 + "mathbb{F}=" + BS4 + "mathbb{C}", "parsed"),
+        ("mathcal 单 token", BS4 + "mathcal M", "parsed"),
+        ("overset 关系符", BS4 + "overset{d}{=}", "skip"),
+        ("stackrel 关系符", BS4 + "stackrel{d}{=}", "skip"),
+    ]
+    for desc, latex, want in font_cases:
+        d = m.verify_with_sympy(m.MathItem(kind="inline", line=1, latex=latex, original=latex))
+        ok = d.status == want
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:18} 预期={want} 实际={d.status}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {want}，实际 {d.status}")
+
+    # renewcommand 必须覆盖 providecommand 的空定义
+    combo = (BS4 + "providecommand{" + BS4 + "C}{}\n"
+             + BS4 + "renewcommand{" + BS4 + "C}{" + BS4 + "mathbb{C}}")
+    mac2 = m.collect_macros(combo)
+    ok = mac2.get("C") == (0, BS4 + "mathbb{C}")
+    passed += ok
+    failed += not ok
+    print(f"  {'PASS' if ok else 'FAIL'}  {'renewcommand 覆盖':18} {'OK' if ok else mac2}")
+    if not ok:
+        fails.append(f"renewcommand 覆盖失败: {mac2.get('C')}")
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 
