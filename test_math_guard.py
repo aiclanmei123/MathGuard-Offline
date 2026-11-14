@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """test_math_guard.py —— math_guard 自身的自测（仿照数论工作台 §13.7 纪律）。
 
@@ -226,6 +226,38 @@ def main() -> int:
         print(f"  {'PASS' if ok else 'FAIL'}  {desc:14} 预期={expect_n} 实际={len(pw)}")
         if not ok:
             fails.append(f"{desc}: 预期 {expect_n} 条标点警告，实际 {len(pw)}")
+        try:
+            os.remove(tmpf)
+        except OSError:
+            pass
+
+    print("\n[空参数检查：\\frac{a}{} 之类]")
+    empty_cases = [
+        ("空分母", BS + "frac{a}{}", 1),
+        ("空分子", BS + "frac{}{b}", 1),
+        ("都空", BS + "frac{}{}", 2),
+        ("正常分数", BS + "frac{a}{b}", 0),
+        ("空 sqrt", BS + "sqrt{}", 1),
+        ("正常 sqrt", BS + "sqrt{x}", 0),
+        ("可选参数不误报", BS + "sqrt[3]{x}", 0),
+        ("空 text", BS + "text{}", 1),
+        ("占位残稿", BS + "frac{" + BS + "cdot}{}", 2),
+        ("正常 cdot", BS + "frac{a" + BS + "cdot b}{c}", 0),
+    ]
+    for desc, body, expect_n in empty_cases:
+        text = ("\\documentclass{article}\n\\begin{document}\n$" + body
+                + "$\n\\end{document}\n")
+        tmpf = os.path.join(tempfile.gettempdir(), "_mg_empty_test.tex")
+        open(tmpf, "w", encoding="utf-8").write(text)
+        d = m.read_tex(tmpf)
+        es, _ = m.syntax_check(d)
+        real = [x for x in es if x.kind in ("empty-arg", "placeholder-arg")]
+        ok = len(real) == expect_n
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:16} 预期={expect_n} 实际={len(real)}")
+        if not ok:
+            fails.append(f"{desc}: 预期 {expect_n} 处，实际 {len(real)}")
         try:
             os.remove(tmpf)
         except OSError:

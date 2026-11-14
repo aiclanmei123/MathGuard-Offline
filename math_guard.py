@@ -908,6 +908,99 @@ def check_math_punctuation(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     return issues
 
 
+def check_empty_args(text: str, doc: TexDocument) -> List[SyntaxIssue]:
+    r"""检查必填参数为空的命令：`\frac{a}{}`、`\sqrt{}`、`\hat{}` 等。
+
+    为什么值得查：这类是**真正的笔误**，LaTeX 不会报错（能编译通过），
+    但排出来分母是个空盒子，读者只能看到 "a/ "。
+
+    实证（Apery 论文 sec7_Sn.tex:145）：
+        \frac{-(e^{-x}-1)^{2}}{}      分母为空
+    而同一段第 148 行写明分母应是 (e^{x}-1)^{2} —— 确实是漏写了。
+
+    以及 sec9_tower.tex:213：
+        \frac{\cdot}{}                分子分母都是占位符，残稿
+
+    只检查**参数明确必填**的命令，避免误报（如 `\sqrt[3]{x}` 的可选参数）。
+    """
+    REQUIRED = {
+        "frac": 2, "dfrac": 2, "tfrac": 2, "cfrac": 2, "binom": 2, "dbinom": 2,
+        "sqrt": 1, "hat": 1, "bar": 1, "vec": 1, "dot": 1, "ddot": 1, "tilde": 1,
+        "widehat": 1, "widetilde": 1, "overline": 1, "underline": 1,
+        "mathbb": 1, "mathcal": 1, "mathrm": 1, "mathbf": 1, "text": 1, "textbf": 1,
+        "operatorname": 1, "label": 1, "ref": 1, "eqref": 1, "cite": 1, "tag": 1,
+    }
+    issues: List[SyntaxIssue] = []
+    scan = mask_verbatim(mask_comments(text))
+
+    def read_group(s: str, i: int):
+        """从 s[i] 读一个 {...}，返回 (内容, 结束位置)；不是 { 则返回 (None, i)。"""
+        while i < len(s) and s[i] in " \t":
+            i += 1
+        if i >= len(s) or s[i] != "{":
+            return None, i
+        depth, j = 0, i
+        while j < len(s):
+            if s[j] == "\\":
+                j += 2
+                continue
+            if s[j] == "{":
+                depth += 1
+            elif s[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[i + 1:j], j + 1
+            j += 1
+        return None, i
+
+    for m in re.finditer(r"\\([A-Za-z]+)\*?", scan):
+        name = m.group(1)
+        n_req = REQUIRED.get(name)
+        if not n_req:
+            continue
+        pos = m.end()
+        # 跳过可选参数 [..]
+        while True:
+            while pos < len(scan) and scan[pos] in " \t\n":
+                pos += 1
+            if pos < len(scan) and scan[pos] == "[":
+                depth = 0
+                while pos < len(scan):
+                    if scan[pos] == "[":
+                        depth += 1
+                    elif scan[pos] == "]":
+                        depth -= 1
+                        if depth == 0:
+                            pos += 1
+                            break
+                    pos += 1
+                continue
+            break
+        for idx in range(n_req):
+            content, pos2 = read_group(scan, pos)
+            if content is None:
+                break
+            body = content.strip()
+            # 空参数
+            if not body:
+                f, ln = doc.origin(m.start())
+                issues.append(SyntaxIssue(
+                    "empty-arg", ln,
+                    f"\\{name} 的第 {idx + 1} 个参数为空（渲染出来是个空盒子）",
+                    os.path.basename(f)))
+            # 占位符参数：\frac{\cdot}{} 这种"分子是个点"的写法
+            # 实证（Apery 论文 sec9_tower.tex:213）：
+            #   \frac{\cdot}{}   —— 作者删掉了内容但留下了占位符，是残稿
+            elif re.fullmatch(r"\\(?:cdot|ldots|cdots|dots|bullet|cdotp)\s*", body):
+                f, ln = doc.origin(m.start())
+                issues.append(SyntaxIssue(
+                    "placeholder-arg", ln,
+                    f"\\{name} 的第 {idx + 1} 个参数是占位符（如 \\cdot），疑似残稿",
+                    os.path.basename(f)))
+            pos = pos2
+    return issues
+
+
 def syntax_check(doc: TexDocument, lint: bool = False) -> Tuple[List[SyntaxIssue], List[SyntaxIssue]]:
     """跑语法检查，返回 (致命错误, 警告)。任何异常都隔离，不影响主流程。
 
@@ -922,7 +1015,8 @@ def syntax_check(doc: TexDocument, lint: bool = False) -> Tuple[List[SyntaxIssue
     """
     errors: List[SyntaxIssue] = []
     warns: List[SyntaxIssue] = []
-    checks = [(check_environments, errors), (check_braces, errors)]
+    checks = [(check_environments, errors), (check_braces, errors),
+              (check_empty_args, errors)]
     if lint:
         checks.append((check_math_punctuation, warns))
     for fn, bucket in checks:
