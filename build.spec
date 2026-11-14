@@ -30,9 +30,23 @@ hiddenimports += ["tkinter", "tkinter.ttk", "tkinter.filedialog",
                   "tkinter.messagebox", "tkinter.font"]
 
 EXCLUDES = [
+    # ---- 体积大头（实测 _internal 里合计约 40 MB）----
+    # PIL / lxml：本工具完全用不到，只是被某些库间接拉进来的。
+    "PIL", "Pillow", "lxml", "yaml",
+    # python-flint：sympy 的可选整数后端，打包后占 21.5 MB
+    #   （python_flint.libs 16.2 + flint 5.2）。
+    #   实测换成纯 python 后端**反而更快**、结果完全一致：
+    #       flint  : 提取 2488 条，合计 1.59 s
+    #       python : 提取 2488 条，合计 1.50 s
+    #   原因：本工具 99% 的工作是纯数字比较，用不上 flint 的大整数加速。
+    "flint", "python_flint", "gmpy2",
+    # OpenSSL：只有 requests/urllib 的 https 才需要；本工具完全离线。
+    #   （"完全离线"是产品承诺，砍掉它同时也是在代码层面兑现承诺）
+    # 注：不在此处排除 ssl —— tkinter/urllib 的导入链上可能出现它，留着更安全。
+    # ---- 科学计算与测试框架 ----
     "parsub", "numpy", "scipy", "matplotlib", "pandas",
     "openpyxl", "fastapi", "uvicorn", "starlette", "typer", "rich",
-    "IPython", "pytest", "PyQt5", "PySide2",
+    "IPython", "pytest", "PyQt5", "PySide2", "PySide6",
     "mpmath.tests", "sympy.testing",
 ]
 

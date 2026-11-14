@@ -72,6 +72,13 @@ import sys
 import threading
 import time
 import traceback
+
+# ⚠ 必须在 import sympy 之前设置：告诉 sympy 用纯 python 的整数后端。
+#   打包时排除了 python-flint（省 21.5 MB），若不声明，sympy 会尝试导入
+#   flint 并在失败时打印警告、或退回到更慢的路径。
+#   实测纯 python 后端反而略快（1.50s vs 1.59s），结果完全一致：
+#   本工具 99% 的工作是纯数字比较，用不上 flint 的大整数加速。
+os.environ.setdefault("SYMPY_GROUND_TYPES", "python")
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
