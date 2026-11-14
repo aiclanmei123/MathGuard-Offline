@@ -297,6 +297,30 @@ def main() -> int:
         except OSError:
             pass
 
+    print("\n[\\def 宏与单 token 参数（arXiv:2408.09776 实战）]")
+    BS2 = "\\"
+    def_src = (
+        BS2 + "def" + BS2 + "f{" + BS2 + "frac}\n"
+        + BS2 + "def" + BS2 + "sls#1#2{(" + BS2 + "f{#1}{#2})}\n"
+        + BS2 + "def" + BS2 + "qp#1{q_p(#1)}\n"
+    )
+    mac = m.collect_macros(def_src)
+    macro_cases = [
+        ("收集 \\def 宏", len(mac) == 3),
+        ("收集到 f", "f" in mac and mac["f"] == (0, BS2 + "frac")),
+        ("收集到 sls(2参)", mac.get("sls", (0, ""))[0] == 2),
+        ("无参宏展开", m.expand_macros(BS2 + "f 1{256}", mac) == BS2 + "frac 1{256}"),
+        ("单 token 参数", m.expand_macros(BS2 + "sls{1+" + BS2 + "sqrt{-7}}2^{24}", mac)
+         == "(" + BS2 + "frac{1+" + BS2 + "sqrt{-7}}{2})^{24}"),
+        ("花括号参数", m.expand_macros(BS2 + "qp{2}", mac) == "q_p(2)"),
+    ]
+    for desc, ok in macro_cases:
+        passed += ok
+        failed += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {desc:18}")
+        if not ok:
+            fails.append(f"宏用例失败：{desc}")
+
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
 

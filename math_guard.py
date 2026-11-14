@@ -468,68 +468,120 @@ _NEWCMD_RE = re.compile(
 )
 
 
+_DEF_RE = re.compile(r"\\(?:def|gdef|edef|xdef)\s*\\([A-Za-z]+)")
+
+
 def collect_macros(text: str) -> Dict[str, Tuple[int, str]]:
-    """从文件里收集 \\newcommand / \\renewcommand 定义，返回 {宏名: (参数个数, 宏体)}。
+    r"""收集 \newcommand / \renewcommand / \def 定义，返回 {宏名: (参数个数, 宏体)}。
 
     为什么需要：老式（尤其 WinEdt + CJK 时代的）论文大量使用自定义宏，例如
-        \\newcommand{\\lp}{\\Big(\\frac{-1}{p}\\Big)}
-        \\newcommand{\\F}[4]{{}_2F_1\\!\\left(#1,#2;\\,#3;\\,#4\\right)}
-    工具不认识这些宏，含宏的公式就只能落到「仅可解析」。实测一份老论文里
-    有 178 条公式受此影响。展开后它们才能真正被验证。
+        \newcommand{\lp}{\Big(\frac{-1}{p}\Big)}
+        \def\sls#1#2{(\f{#1}{#2})}
+    工具不认识这些宏，含宏的公式就只能落到「仅可解析」。
+    实测一份老论文里有 178 条公式受此影响。展开后它们才能真正被验证。
+
+    ⚠ \def 支持是后来补的（2026-11-14）。arXiv:2408.09776 用 14 个 \def
+      定义了 \f=\frac、\sls#1#2={(\f{#1}{#2})}、\Ls 等单字母/短名宏。
+      只认 \newcommand 时收集到 0 个宏，导致 \sls{1+\sqrt{-7}}2^{24}
+      被当成乱码，sympy 展开成 `**2** 24` 这种双重幂，单条耗时 4.4 秒，
+      整篇论文跑不完（>5 分钟无输出）。
     """
     macros: Dict[str, Tuple[int, str]] = {}
+
+    def _body_from(pos: int) -> Optional[str]:
+        """从 pos 处的 '{' 开始配对，返回宏体内容。"""
+        if pos >= len(text) or text[pos] != "{":
+            return None
+        depth, i, n = 0, pos, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[pos + 1:i]
+            i += 1
+        return None
+
+    # ---- 1) \newcommand / \renewcommand / \providecommand ----
     for m in _NEWCMD_RE.finditer(text):
         name = m.group(1) or m.group(2)
         nargs = int(m.group(3) or 0)
-        # 手动配对花括号取宏体（宏体里可能嵌套花括号）
-        start = m.end() - 1
-        depth, i, n = 0, start, len(text)
-        while i < n:
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        if i < n and depth == 0:
-            body = text[start + 1:i]
-            if name not in macros:      # 先定义先得，与 LaTeX 语义一致
-                macros[name] = (nargs, body)
+        body = _body_from(m.end() - 1)
+        if body is not None and name and name not in macros:
+            macros[name] = (nargs, body)
+
+    # ---- 2) \def\name#1#2{...} / \def\name{...} ----
+    for m in _DEF_RE.finditer(text):
+        name = m.group(1)
+        # 参数个数 = 宏名后面、{ 之前出现的 #N
+        head = text[m.end() - 1:text.find("{", m.end() - 1)] if "{" in text[m.end() - 1:] else ""
+        nargs = len(set(re.findall(r"#(\d)", head)))
+        body = _body_from(text.find("{", m.end() - 1))
+        if body is not None and name and name not in macros:
+            macros[name] = (nargs, body)
+
     return macros
 
 
 def _expand_nargs(text: str, name: str, nargs: int, body: str) -> str:
-    """把带 n 个参数的宏整体替换掉（包括它后面的 {...} 参数）。
+    r"""把带 n 个参数的宏整体替换掉（包括它后面的参数）。
 
-    例：\\uu[1]{u_{#1}(j)} 作用于 "\\uu{k}" -> "u_{k}(j)"（参数 {k} 被消耗掉）。
+    例：\uu[1]{u_{#1}(j)} 作用于 "\uu{k}" -> "u_{k}(j)"（参数 {k} 被消耗掉）。
+
+    ⚠ 参数不一定是花括号。LaTeX 的规则是「一个 token」：
+        \sls{1+\sqrt{-7}}2      第二个参数就是裸的 `2`
+        \qp{2}                  参数是 {2}
+    早期版本只认 `{...}`，遇到 \sls{...}2 就放弃展开，导致
+    arXiv:2408.09776 里 \sls/\Ls 全程未展开，sympy 把 `\sls{..}2` 误解析成
+    `**2** 24` 这类双重幂，单条耗时 4.4 秒，整篇跑不完（>5 分钟）。
     """
     pattern = re.compile("\\\\" + name + r"(?![A-Za-z])")
     out, last = [], 0
     for mo in pattern.finditer(text):
+        if mo.start() < last:      # 已被前一个替换覆盖
+            continue
         rest = text[mo.end():]
         args, pos = [], 0
         ok = True
         for _i in range(nargs):
             while pos < len(rest) and rest[pos] in " \t":
                 pos += 1
-            if pos >= len(rest) or rest[pos] != "{":
+            if pos >= len(rest):
                 ok = False
                 break
-            depth, j = 0, pos
-            while j < len(rest):
-                if rest[j] == "{":
-                    depth += 1
-                elif rest[j] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            if depth != 0:
-                ok = False
-                break
-            args.append(rest[pos + 1:j])
-            pos = j + 1
+            if rest[pos] == "{":
+                # 花括号参数：配对取内容
+                depth, j = 0, pos
+                while j < len(rest):
+                    if rest[j] == "{":
+                        depth += 1
+                    elif rest[j] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                if depth != 0:
+                    ok = False
+                    break
+                args.append(rest[pos + 1:j])
+                pos = j + 1
+            elif rest[pos] == "\\":
+                # 控制序列作为一个 token（如 \alpha、\frac）
+                mm = re.match(r"\\[A-Za-z]+|\\.", rest[pos:])
+                if not mm:
+                    ok = False
+                    break
+                args.append(mm.group(0))
+                pos += mm.end()
+            else:
+                # 单个字符即为一个参数（LaTeX 的 token 规则）
+                args.append(rest[pos])
+                pos += 1
         if not ok:
             continue   # 参数不全，保持原样
         rep = body
@@ -2727,6 +2779,51 @@ def _count_paragraphs(text: str) -> int:
     return n
 
 
+def _chapter_file_warning(path: Path, doc: TexDocument) -> str:
+    r"""判断被检查的文件是不是「章节文件」而非主文件。
+
+    返回提示文字（空串表示看起来是主文件）。
+
+    判据（保守，只在很确定时才提示）：
+      · 文件里**没有** \documentclass
+      · 且同目录下**存在**含 \documentclass 且 \input/\include 了本文件的 .tex
+    """
+    try:
+        raw = doc.files[0][1] if doc.files else doc.text
+    except Exception:
+        raw = doc.text
+    if "\\documentclass" in raw:
+        return ""
+    stem = path.stem
+    parent = path.parent
+    # 同级目录 + 父目录（章节常放在 sections/ 子目录，主文件在上一层）
+    candidates = []
+    for d in (parent, parent.parent):
+        try:
+            candidates.extend(p for p in d.iterdir()
+                              if p.suffix.lower() == ".tex" and p.resolve() != path.resolve())
+        except OSError:
+            continue
+    for sib in candidates:
+        try:
+            if sib.stat().st_size > 4_000_000:
+                continue
+            # ⚠ 必须读**原始字节**，不能用 read_tex：后者会展开 \input，
+            #    合并后的文本里再也找不到 "\input{sections/xxx}" 这条语句，
+            #    导致检测永远不触发。
+            raw_txt, _enc = _decode_bytes(sib.read_bytes(), str(sib))
+        except Exception:
+            continue
+        if "\\documentclass" not in raw_txt:
+            continue
+        # \input 可能带路径（sections/dataset_constructing.tex 或 sections/xxx）
+        pat = (r"\\(?:input|include|subfile)\s*\{\s*(?:[^{}]*[/\\])?"
+               + re.escape(stem) + r"(?:\.tex)?\s*\}")
+        if re.search(pat, raw_txt):
+            return f"「{path.name}」看起来是章节文件，主文件是「{sib.name}」"
+    return ""
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global S
     _init_console()
@@ -2789,6 +2886,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     _, sympy_desc = _sympy_available()
     env_lines: List[str] = [sympy_desc, "超长整数保护 ✔" if LONGINT_SAFE else "超长整数保护 —"]
+
+    # ---------- 前置守卫：是否误传了章节文件 ----------
+    # 多文件项目里，\label 常在别的章节、\ref 在本章节。若把章节文件当主文件，
+    # 未定义引用/孤儿标签全是假的。
+    # 实证（arXiv:2303.09095）：把 dataset_constructing.tex 当主文件，报 2 处
+    # 未定义引用，而这两个 label 分别定义在 dataset.tex 和 PaperForReview.tex 里。
+    sub_note = _chapter_file_warning(path, doc)
+    if sub_note:
+        print(f"{S.YELLOW}⚠ {sub_note}{S.RESET}")
+        print(f"  {S.DIM}本章节单独看时，引用/标签的统计结果不可信，请指向主文件。{S.RESET}")
+        print()
 
     # ---------- 模块一：结构检查（latexnav 与内置解析器交叉校验）----------
     try:
