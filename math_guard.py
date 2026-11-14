@@ -1087,6 +1087,32 @@ def _nearby_modulo(text: str, start: int, end: int, window: int = 120) -> bool:
     return False
 
 
+def _inline_symbol_context(text: str, start: int, end: int, latex: str = "") -> bool:
+    r"""判断一个行内 $...$ 是否在「拿符号代替文字」而非写一条完整公式。
+
+    实证案例：
+        拟合所需数据点数 $=$ 未知数个数 $+$ 余量（$\ge5$）
+        ￥题设常数 $=2\times10^{-4}$ ￥
+        ESS$>1000$、$\alpha$ 均值仅 $6\times10^{-4}$（95%CI $[5,9]\times10^{-4}$）
+
+    这些片段的共同点：**以关系符开头**（=、>、<、\ge 等），
+    它们是对前面文字的补充说明，不是在独立断言某个等式。
+
+    反例（必须仍然报错）：
+        $2+2=5$  —— 完整公式，开头是数字，不是关系符。
+    """
+    # 核心判据：公式本身以关系符开头
+    core = latex.strip()
+    if not re.match(r"^\s*(?:[=<>]|\\le|\\leq|\\ge|\\geq|\\neq|\\ne|\\approx|\\equiv|\\to)", core):
+        return False
+    # 要求紧邻的字符不是换行（公式自身不能跨行拆开）
+    # ⚠ 只能看紧邻的 1~2 个字符：早期版本检查前后 20 字符内的换行，
+    #   结果在真实文档里因为前面几行是 \documentclass，导致永远判定失败。
+    left = text[max(0, start - 2):start]
+    right = text[end:end + 2]
+    return "\n" not in left and "\n" not in right
+
+
 def gather_math_items(doc: TexDocument) -> List[MathItem]:
     text = mask_verbatim(mask_comments(doc.text))
     macros = collect_macros(text)   # 老论文的自定义宏，提取时展开
@@ -1109,6 +1135,12 @@ def gather_math_items(doc: TexDocument) -> List[MathItem]:
         # 所以只要紧邻的文本提到取模/pmod，就把整条降级为「仅可解析」。
         if _nearby_modulo(text, start, start + len(body)):
             kind = "modctx"
+        # 行内「符号代用」：$$插在中文句子中间，是拿它代替一个符号，不是一条公式。
+        # 实证："拟合所需数据点数 $=$ 未知数个数 $+$ 余量（$\ge5$）"
+        #   这里的 = + ≥5 都在代替符号，按"缺操作数"判错就是假阳性。
+        # 判据：行内公式位于同一行内、且前后紧邻的都不是数学定界符/空白。
+        if kind == "inline" and _inline_symbol_context(text, start, start + len(body), expanded):
+            kind = "symctx"
         items.append(MathItem(kind=kind, line=line, latex=expanded,
                               original=doc.text[start:start + len(body)], env=env))
         occupied.append((start, start + len(body)))
@@ -1647,6 +1679,10 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
             return CheckDetail(latex=item.latex, status="parsed",
                                reason="相邻文字提到取模，等号可能是模意义写法",
                                line=item.line, kind=item.kind, relations=len(ops))
+        if item.kind == "symctx":
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="嵌在中文句中的符号代用（如 $=$、$\\ge5$），非完整公式",
+                               line=item.line, kind=item.kind, relations=len(ops))
         if _LEGENDRE_RE.search(item.latex):
             return CheckDetail(latex=item.latex, status="parsed",
                                reason="勒让德/雅可比符号记号（a/p），不是除法等式",
@@ -1662,11 +1698,65 @@ def verify_with_sympy(item: MathItem) -> CheckDetail:
 
         compact_parts = [re.sub(r"\s+", "", p) for p in parts]
         if ops and any(p == "" for p in compact_parts):
-            # 「排版用的关系式片段」：如 $=$、$+$、$\ge5$，孤立的 = 不是笔误。
-            # 不限 inline —— 实测 $$ ... $$ 里的不等式续行（以 \le 开头）也会中招。
-            if _RELATION_FRAGMENT_RE.search(item.latex):
+            # 1) 「排版用的关系式片段」：如 $=$、$+$、$\ge5$，孤立的 = 不是笔误。
+            #    判据：整个公式**没有任何字母/变量**（只有符号和至多一个数字）才算。
+            #    "x =" 里有字母 x，那是真笔误，必须继续往下判。
+            frag = _RELATION_FRAGMENT_RE.search(item.latex)
+            core = re.sub(r"[\s\\{}]", "", item.latex)
+            has_var = bool(re.search(r"[A-Za-z]", core))
+            if frag and not has_var and len(core) <= 4:
                 return CheckDetail(latex=item.latex, status="skip",
                                    reason="排版用的关系式片段（如 =、+、≥），非完整公式",
+                                   line=item.line, kind=item.kind)
+            # 2) 操作数是 \text{中文} 之类的文字标签：
+            #    "教育价值 \ge P_{75}" 是合法的「文字标签 ≥ 数值」写法，
+            #    中文被清空成空格后看起来"缺操作数"，其实是误判。
+            #    实证：华为杯论文 L243 因此被误报。
+            if re.search(r"\\text\s*\{[^{}]*\}|\\mbox\s*\{[^{}]*\}|\\textit\s*\{[^{}]*\}"
+                         r"|[\u4e00-\u9fff]", item.original):
+                return CheckDetail(latex=item.latex, status="parsed",
+                                   reason="操作数含文字标签（如 \\text{中文}），非纯数学断言",
+                                   line=item.line, kind=item.kind)
+            # 3) 逻辑联结词 \land \lor 会把式子切成多段，段首段尾本就是操作数
+            if re.search(r"\\(?:land|lor|wedge|vee|implies|iff)\b", item.original):
+                return CheckDetail(latex=item.latex, status="parsed",
+                                   reason="含逻辑联结词（\\land / \\lor），由多个条件组合而成",
+                                   line=item.line, kind=item.kind)
+            # 4) \char 等底层字符命令：多为格式转换残渣，不作断言
+            if re.search(r"\\char\s*\"?[0-9A-Fa-f]+|\{\\char", item.original):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="含 \\char 底层字符命令（常见于格式转换残渣）",
+                                   line=item.line, kind=item.kind)
+            # 5) 「悬空关系符」：多行公式被排版拆开造成的半句。
+            #    结尾型：\displaystyle\Sigma_{4}(m)\equiv   /   p^{2}=
+            #    开头型：=2\times10^{-4}   /   \ge5
+            #    两者都不是笔误，是 alignsplit 断行的产物。
+            stripped = item.latex.strip()
+            # 「续行」必须真的是排版断行产物，而不是一句写错了的公式。
+            # 判据（缺一不可）：
+            #   · 出现在行间公式里（display/inline 都可能，但 inline 不能太短）；
+            #   · 关系符一侧为空，另一侧有内容；
+            #   · 整个公式不含 \displaystyle 之外的控制序列时，还要求长度足够短——
+            #     "x =" 这种只有两个 token 的，宁可报错让人看一眼，也不放过。
+            has_display_hint = bool(re.search(r"\\(?:displaystyle|begin|end|qquad|quad|\\\\)",
+                                              item.latex))
+            token_count = len(re.findall(r"[A-Za-z\\]+|\d+|[^\sA-Za-z\d]", stripped))
+            # 「关系符在一端、另一端有实质内容」= 续行；两端都没内容才是真笔误。
+            #   "\ge5"    -> 关系符在开头、右边有 5  -> 续行
+            #   "x ="     -> 关系符在结尾、左边有 x，右边全空 -> 也可能续行，但太短则报错
+            #   实际区分：右边非空（开头型）通常可信；结尾型需要更多 token 佐证。
+            looks_like_continuation = has_display_hint or token_count > 3
+            # 开头型：=、>=、\ge 在开头，右边必须有内容 —— 这是明确的续行
+            if re.match(r"^\s*(?:[=<>]|\\le|\\leq|\\ge|\\geq|\\neq|\\ne|\\equiv|\\sim|\\approx"
+                        r"|\\simeq|\\cong|\\propto)\s*\S", stripped):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="多行公式的续行或不完整关系（关系符在开头），非完整公式",
+                                   line=item.line, kind=item.kind)
+            # 结尾型：关系符在结尾、左边有内容，且不是极短式子
+            if looks_like_continuation and re.search(
+                    r"(?:[=<>&\+-]|\\equiv|\\le|\\leq|\\ge|\\geq|\\neq|\\ne|\\approx)\s*$", stripped):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="多行公式的续行（以关系符结尾），非完整公式",
                                    line=item.line, kind=item.kind)
             return CheckDetail(latex=item.latex, status="error",
                                reason="关系符缺少一侧操作数，疑似笔误",
