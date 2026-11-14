@@ -33,3 +33,6 @@ math_guard_demo.tex
 # 分发产物（用 GitHub Releases 发布，不进版本库）
 MathGuard-Windows-x64.zip
 
+
+# 一次性登录辅助脚本（含 client_id，不进仓库）
+github_device_login*.py
