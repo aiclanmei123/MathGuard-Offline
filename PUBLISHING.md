@@ -1,145 +1,121 @@
-# 从零到发布 —— 完整操作清单
+# 网络受限环境下的发布路线（实测可行）
 
-> 当前状态（2026-11-14 实测）：
-> - ✅ 代码已写好并在本机跑通（31 项自测全过）
-> - ✅ 仓库已初始化并提交（单提交 `39c9303`，9 个文件 3143 行）
-> - ✅ exe 已打包（37.8 MB，免装 Python）
-> - ❌ **还没有 GitHub 账号**（凭据管理器空、无 `.gitconfig`、未装 GitHub Desktop）
+> 背景：你这台机器访问 `github.com/signup` 返回 **403 访问受限**（IP 被判定为机器人），
+> 但 `github.com/login` 和 `github.com/login/device` 都是 **200 正常**。
 >
-> 下面是从零开始的完整步骤。全程约 15 分钟。
+> **实测结论**：
+> - `git ls-remote https://github.com/...` → **成功**（git 协议完全正常）
+> - `https://github.com/login/device/code` → **成功下发设备码**（`11C1-261F` 之类）
+>
+> 所以：**只有"注册"这一步需要换网络，之后全部可以在这台电脑上完成。**
 
 ---
 
-## 第 1 步：注册 GitHub 账号（5 分钟）
+## 步骤 1：用手机流量注册（唯一需要换网络的一步）
 
-1. 打开 https://github.com/signup
-2. 填邮箱 → 设密码 → 起用户名
-   - **用户名会出现在仓库地址里**，建议短且有辨识度，例如 `yimingwang` 或 `yw-ang`
-   - 中文用户名不支持，只能用字母数字和连字符
-3. 验证邮箱（GitHub 会发一封带验证码的邮件）
-4. 跳过 "personalize your experience" 之类的引导，直接进主页
+1. **关闭手机 WiFi，改用 4G/5G 流量**
+2. 手机浏览器打开：`https://github.com/signup`
+3. 填邮箱 → 密码 → 用户名
+   - 用户名会出现在仓库地址里，建议短一点，例如 `yimingwang`
+   - 只能用字母、数字、连字符，不支持中文
+4. 收邮件验证码，完成验证
+5. 见到 "Let's get started" 页面就成功了
 
-> 不需要付费。免费账号可以建无限量私有/公开仓库。
-
----
-
-## 第 2 步：安装 GitHub Desktop（3 分钟）
-
-下载：https://desktop.github.com/
-
-安装后打开 → `Sign in to GitHub.com` → 用第 1 步的账号登录（会跳浏览器授权）。
-
-> 为什么不装 GitHub Desktop 而用命令行？
-> 命令行 push 需要配置 Personal Access Token，配置过程比 Desktop 复杂。
-> Desktop 用浏览器 OAuth，点几下就完成。
+> **为什么用流量**：你家宽带的公网 IP（`223.67.108.7`）已被 GitHub 标记，
+> 手机流量的出口 IP 通常不同，大概率不被拦。
+>
+> 如果手机也被拦，退路见文末"方案 B"。
 
 ---
 
-## 第 3 步：把本地仓库加进去（1 分钟）
+## 步骤 2：回到电脑，用设备码登录（不需要浏览器）
 
-1. GitHub Desktop 菜单：`File` → `Add local repository...`
-2. 选择这个文件夹（直接复制粘贴到路径栏）：
-   ```
-   C:\Users\yummy15\Documents\deepseek-harness\default-workspace\MathGuard-Offline
-   ```
-3. 点 `Add repository`
-
-左侧应该显示 `MathGuard-Offline`，右侧显示 9 个文件和一个提交。
-
----
-
-## 第 4 步：发布（1 分钟）
-
-点右上角 `Publish repository`，填写：
-
-| 字段 | 填什么 |
-|---|---|
-| **Name** | `MathGuard-Offline` |
-| **Description** | `纯离线的 LaTeX 结构与公式数值校验工具。四态报告，零假阳性，拒绝用大模型做算术。` |
-| **Keep this code private** | ☑️ **勾上**（见下方说明） |
-
-点 `Publish repository`。
-
----
-
-## 第 5 步：上传 exe 到 Releases（2 分钟）
-
-仓库里不放 38 MB 的 zip，用 Releases：
-
-1. 浏览器打开你的仓库页面
-2. 右侧 `Releases` → `Create a new release`
-3. 填写：
-   - **Tag version**: `v1.0.0`
-   - **Release title**: `MathGuard v1.0.0`
-   - **Description**（可直接复制）：
-
-     ```markdown
-     ## 下载
-
-     **Windows x64 · 免安装 Python**：`MathGuard-Windows-x64.zip`
-
-     解压后运行：
-     ```cmd
-     math_guard.exe 你的论文.tex
-     ```
-
-     ## 核心特性
-
-     - 四态报告：`[✓]` 已验证 / `[✗]` 验证失败 / `[≈]` 仅可解析 / `[–]` 无法验证
-     - 零假阳性优先：宁可少报，不可错报
-     - 完全离线，无需联网
-     - 支持 GBK 老稿件、多文件 `\input`、自定义 `\newcommand` 宏
-
-     ## 已知边界
-
-     - 只接受 `.tex`，不接受 PDF（PDF 公式无法还原，会明确拒绝）
-     - 不验证证明的正确性，只做结构与数值校验
-     ```
-
-4. 把 `MathGuard-Windows-x64.zip` 拖进 "Attach binaries" 区域
-5. 点 `Publish release`
-
----
-
-## 第 6 步：找个同学试用（最重要）
-
-给同门发这句话：
-
-> 我写了个完全不联网的小工具，能查 LaTeX 的 label 引用问题和数值算错。
-> 你把论文的 .tex 丢进去跑一下？解压即用，不用装 Python。
-> 跑出来什么贴给我看看。
-
-**重点关注两件事**：
-1. 有没有他说"这个我写对了，它却报错" → 这是假阳性，最严重
-2. 有没有大量 `[≈] 仅可解析` → 可能是我漏检了能判定的情况
-
----
-
-## 为什么建议先设私有
-
-| 理由 | 说明 |
-|---|---|
-| **exe 没有代码签名** | 公开后可能被人重新打包伪装成你的版本 |
-| **可撤回** | 万一又发现一类假阳性，私有仓库改起来没压力 |
-| **先验证价值** | 等有 2–3 人真的用起来再公开也不迟 |
-
-确认没问题后转公开：仓库 `Settings` → 拉到底 `Danger Zone` → `Change visibility` → `Change to public`。
-
----
-
-## 之后改代码的流程
+在 PowerShell 里执行：
 
 ```powershell
 cd "C:\Users\yummy15\Documents\deepseek-harness\default-workspace\MathGuard-Offline"
 
-# 1. 改完先跑自测（必须 31 项全过）
-python test_math_guard.py
-
-# 2. GitHub Desktop 里会自动显示改动 → 填一句说明 → Commit → Push
-
-# 3. 如果改了判定逻辑，还要重新打包 exe 并更新 Release
-python -m PyInstaller build.spec --noconfirm
+& "C:\Program Files\Git\ucrt64\bin\git-credential-manager.exe" github login --device --no-ui
 ```
 
-**铁律**：改任何判定逻辑，必须先跑 `test_math_guard.py`。理由：
-一个永远报"通过"的防幻觉工具，本身就是幻觉。
+终端会显示类似：
+
+```
+Please enter the code: 11C1-261F
+and navigate to: https://github.com/login/device
+```
+
+然后：
+
+1. **在手机浏览器**打开 `https://github.com/login/device`（登录页不被拦）
+2. 输入终端显示的那个码
+3. 点 Authorize
+4. 电脑终端会显示登录成功
+
+> 为什么用手机输入码？因为该页面在电脑上虽然能打开，但如果你之后又在电脑浏览器里
+> 遇到验证码，用手机走一遍会顺得多。两边都行，看你方便。
+
+---
+
+## 步骤 3：建仓库并推送
+
+登录成功后，在电脑上执行：
+
+```powershell
+cd "C:\Users\yummy15\Documents\deepseek-harness\default-workspace\MathGuard-Offline"
+
+# 建远程仓库（需要先在手机上用 GitHub 网页建一个空仓库，或用 gh CLI）
+git remote add origin https://github.com/你的用户名/MathGuard-Offline.git
+git branch -M main
+git push -u origin main
+```
+
+**建空仓库这一步**：手机浏览器打开 `https://github.com/new`
+- Repository name: `MathGuard-Offline`
+- 选 **Private**
+- **不要**勾选 "Add a README file"（本地已有）
+- 点 Create repository
+
+---
+
+## 步骤 4：上传 exe 到 Releases
+
+手机上也能做（`https://github.com/你的用户名/MathGuard-Offline/releases/new`），
+但要把 38 MB 的 zip 传上去，用电脑网页更方便：
+
+1. 电脑浏览器打开仓库页
+2. 右侧 `Releases` → `Create a new release`
+3. Tag: `v1.0.0`，Title: `MathGuard v1.0.0`
+4. 把 `MathGuard-Windows-x64.zip` 拖进 "Attach binaries"
+5. Publish release
+
+> 如果 computer 网页也被验证码拦，见"方案 B"。
+
+---
+
+## 方案 B：如果实在过不去
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **Gitee（码云）** | `gitee.com` 国内不拦，注册和推送都很顺 | 社区小一些，但私有的发布够用 |
+| **直接发 zip** | 把 `MathGuard-Windows-x64.zip` 用微信/QQ 发给同学 | 没有仓库，但功能一个不少 |
+| **等几小时** | GitHub 的 IP 封禁常是临时的，换个时间段再试 | 可能明天就好了 |
+
+**核心提醒**：GitHub 上的仓库是"分发渠道"，不是"功能本身"。
+工具已经打包好了，**发给同学用不需要任何账号**。
+如果你只是想让人试用，直接把 zip 发过去就够了。
+
+---
+
+## 已验证的状态
+
+| 项目 | 状态 |
+|---|---|
+| git 安装 | ✅ 2.56.0 |
+| git 协议连通 GitHub | ✅ `ls-remote` 成功 |
+| Git Credential Manager | ✅ 2.9.1，已配置为 helper |
+| 设备码端点 | ✅ 实测拿到 user_code |
+| 注册页（电脑） | ❌ 403 |
+| 登录页 / 设备码页 | ✅ 200 |
+| 本地仓库 | ✅ 单提交，9 文件 3143 行 |
+| exe | ✅ 37.8 MB，与源码行为一致 |
