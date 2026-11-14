@@ -790,6 +790,19 @@ _LEFT_RIGHT_RE = re.compile(r"\\(left|right)\s*(\\[()\[\]{}|.<>]|\\\{|\\\}|[()\[
 # verbatim 类环境整体跳过（里面内容原样，不应检查括号）
 _VERBATIM_ENVS = {"verbatim", "verbatim*", "Verbatim", "lstlisting", "minted", "comment", "alltt"}
 
+# 「代码展示型」环境：宏包文档里专门用来**原样显示 LaTeX 源码**的环境。
+# 里面的 \begin / \end / 花括号是给读者看的示例，不是真实的嵌套。
+# 实证（CTAN tcolorbox 文档）：
+#     \begin{dispListing}
+#     \begin{tcolorbox}[breakable,...]     ← 要展示的代码，故意不闭合
+#     \end{dispListing}
+# 不跳过就会误报「tcolorbox 没有对应的 \end{tcolorbox}」。
+_DISPLAY_ENVS = {
+    "dispListing", "dispListing*", "dispExample", "dispExample*",
+    "LaTeXdemo", "latexdemo", "LTXexample", "example", "example*",
+    "guidelisting", "guideListing", "showexpl", "lstexample",
+}
+
 
 def _blank_macro_definitions(text: str) -> str:
     r"""把 \def / \newcommand 的**定义体**替换成等长空格。
@@ -805,25 +818,83 @@ def _blank_macro_definitions(text: str) -> str:
     """
     out = list(text)
     i, n = 0, len(text)
-    pat = re.compile(r"\\(def|gdef|edef|xdef|newcommand|renewcommand|providecommand)\b")
+    pat = re.compile(
+        r"\\(def|gdef|edef|xdef|newcommand|renewcommand|providecommand"
+        r"|NewDocumentCommand|RenewDocumentCommand|ProvideDocumentCommand"
+        r"|DeclareDocumentCommand|DeclareRobustCommand)\b")
+
+    def _skip_group(s: str, pos: int) -> int:
+        """从 pos 起跳过可选的 {...} 或 [...] 组，返回结束位置。"""
+        while pos < n and s[pos] in " \t":
+            pos += 1
+        if pos >= n or s[pos] not in "{[":
+            return pos
+        open_ch = s[pos]
+        close_ch = "}" if open_ch == "{" else "]"
+        depth, k = 0, pos
+        while k < n:
+            c = s[k]
+            if c == "\\":
+                k += 2
+                continue
+            if c == open_ch:
+                depth += 1
+            elif c == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return k + 1
+            k += 1
+        return pos
+
     while i < n:
         m = pat.search(text, i)
         if not m:
             break
+        cmd = m.group(1)
         j = m.end()
-        # 跳到第一个未转义的 '{'，那之前是宏名/参数个数说明
-        while j < n and text[j] != "{":
-            if text[j] == "\\":
-                j += 2
-                continue
-            if text[j] == "\n" and j > m.end() + 200:
-                j = -1
+        if cmd in ("def", "gdef", "edef", "xdef"):
+            # \def\name#1#2{body}：跳过宏名（\xxx 或单个字符）与 #n 说明
+            if j < n and text[j] == "\\":
+                while j < n and text[j].isalpha():
+                    j += 1
+            elif j < n:
+                j += 1
+            # 跳过 #1 #2 ... 形式参数说明
+            while j < n:
+                if text[j] == "#" and j + 1 < n and text[j + 1].isdigit():
+                    j += 2
+                    continue
+                if text[j] in " \t":
+                    j += 1
+                    continue
                 break
+        else:
+            # \newcommand{\name}[n][default]{body}
+            # xparse 版：\NewDocumentCommand{\name}{argspec}{body}
+            j = _skip_group(text, j)          # 宏名
+            if cmd.startswith(("NewDocument", "RenewDocument", "ProvideDocument",
+                               "DeclareDocument")):
+                j = _skip_group(text, j)      # 参数规格
+            else:
+                # [n] 无需处理；[default] 里可能含 \left/\right（被当默认定界符），
+                # 实证（CTAN testmath.tex L102）：
+                #   \newcommand{\eval}[2][\right]{\relax \ifx#1\right...}
+                # 这些 \right/\left 是宏定义的一部分，不是真实配对。
+                j = _skip_group(text, j)      # [n]
+                k0 = j
+                while k0 < n and text[k0] in " \t":
+                    k0 += 1
+                if k0 < n and text[k0] == "[":
+                    j = _skip_group(text, k0)
+                    for p in range(k0, j):
+                        if text[p] != "\n":
+                            out[p] = " "
+        # 现在 j 应指向定义体的 '{'
+        while j < n and text[j] not in "{\n":
             j += 1
-        if j < 0 or j >= n:
+        if j >= n or text[j] != "{":
             i = m.end()
             continue
-        # 逐字符配对，取出整个定义体
         depth, k = 0, j
         while k < n:
             c = text[k]
@@ -867,26 +938,65 @@ def _blank_environment_definitions(text: str) -> str:
     """
     out = list(text)
     i, n = 0, len(text)
-    pat = re.compile(r"\\newenvironment\*?\s*\{[^{}]*\}")
+    # \newenvironment{name}[n][default]{begin}{end}
+    # 以及 xparse 的 \NewDocumentEnvironment{name}{argspec}{begin}{end}
+    pat = re.compile(
+        r"\\(?:newenvironment|renewenvironment"
+        r"|NewDocumentEnvironment|RenewDocumentEnvironment"
+        r"|ProvideDocumentEnvironment|DeclareDocumentEnvironment)\*?")
     while True:
         m = pat.search(text, i)
         if not m:
             break
         j = m.end()
-        # 跳过可选的 [nargs] 与 [default]
+        # 跳过环境名 {name}
         while j < n and text[j] in " \t\n":
             j += 1
-        while j < n and text[j] == "[":
-            depth_b = 1
-            j += 1
-            while j < n and depth_b:
-                if text[j] == "[":
-                    depth_b += 1
-                elif text[j] == "]":
-                    depth_b -= 1
-                j += 1
+        if j < n and text[j] == "{":
+            depth, k = 0, j
+            while k < n:
+                if text[k] == "\\":
+                    k += 2
+                    continue
+                if text[k] == "{":
+                    depth += 1
+                elif text[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            j = k + 1 if k < n else j
+        is_xparse = m.group(0).lstrip("\\").startswith(("NewDocument", "RenewDocument",
+                                                        "ProvideDocument",
+                                                        "DeclareDocument"))
+        # 跳过参数说明：xparse 是 {argspec}；传统是 [n][default]
+        if is_xparse:
             while j < n and text[j] in " \t\n":
                 j += 1
+            if j < n and text[j] == "{":
+                depth, k = 0, j
+                while k < n:
+                    if text[k] == "\\":
+                        k += 2
+                        continue
+                    if text[k] == "{":
+                        depth += 1
+                    elif text[k] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    k += 1
+                j = k + 1 if k < n else j
+        else:
+            # 跳过可选 [n] 与 [default]
+            for _ in range(2):
+                while j < n and text[j] in " \t\n":
+                    j += 1
+                if j < n and text[j] == "[":
+                    k = text.find("]", j)
+                    j = (k + 1) if k > 0 else j
+                else:
+                    break
         # 依次吞掉接下来的 {...} 体（begin 体、end 体）
         consumed_any = False
         for _ in range(2):
@@ -924,6 +1034,88 @@ def _blank_environment_definitions(text: str) -> str:
     return "".join(out)
 
 
+def _blank_inline_verb(text: str) -> str:
+    r"""把 \verb|...| / \verb!...! 等**行内代码**抹成等长空格。
+
+    \verb 后面的内容原样输出，里面的 { } $ 都是字面量，不参与配对检查。
+
+    实证（CTAN amsmath technote.tex L147）：
+        via \verb'\hbox{$'
+    这里的 `{$` 是字面文本，不闭合也合法；不剥离会误报"左花括号没有闭合"。
+    """
+    out = text
+    for m in re.finditer(r"\\verb\*?(?![A-Za-z])(.)(.*?)\1", out, re.S):
+        pass   # 只为确认能找到
+    # 逐字符扫描替换（保留长度）
+    res = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("\\verb", i) and (i + 5 >= n or not text[i + 5].isalpha()):
+            j = i + 5
+            if j < n and text[j] == "*":
+                j += 1
+            if j < n:
+                delim = text[j]
+                if not delim.isalnum() and delim != " ":
+                    k = text.find(delim, j + 1)
+                    end = (k + 1) if k > 0 else n
+                    for p in range(i, end):
+                        if text[p] != "\n":
+                            res[p] = " "
+                    i = end
+                    continue
+        i += 1
+    return "".join(res)
+
+
+def _blank_env_arguments(text: str) -> str:
+    r"""把 \begin{xxx} / \end{xxx} **紧跟的花括号参数**抹成等长空格。
+
+    为什么要剥：宏包手册里常用带参数的环境来**展示错误信息**：
+        \begin{error}{\begin{split} won't work here.}
+    参数里出现的 \begin{split} 是被展示的文本，不是真实嵌套。
+    若不抹掉，split 会被压进环境栈、永远等不到 \end{split}，
+    最终误报"error 环境嵌套错序"（CTAN amsldoc.tex 实测）。
+
+    ⚠ 不能用正则 `[^{}]*`：参数内部本身可能含花括号（如上面的例子），
+      必须用栈式配对，把**整段参数连同其中所有 \begin 一起**抹掉。
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    pat = re.compile(r"\\(?:begin|end)\s*\{[^{}]*\}")
+    # ⚠ 必须在**原始 text** 上搜索（out 会被逐步置空，无法再搜），
+    #   但写入 out。两者长度相同，下标可以直接对应。
+    while True:
+        m = pat.search(text, i)
+        if not m:
+            break
+        j = m.end()
+        while j < n and text[j] in " \t":
+            j += 1
+        if j < n and text[j] == "{":
+            depth, k = 0, j
+            while k < n:
+                c = text[k]
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if k < n:
+                for p in range(j, k + 1):
+                    if text[p] != "\n":
+                        out[p] = " "
+                i = k + 1
+                continue
+        i = m.end()
+    return "".join(out)
+
+
 def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     r"""模块三：\begin{xxx} 与 \end{xxx} 是否配对。
 
@@ -941,8 +1133,10 @@ def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     # 其中 `%\begin{equation}` 与 `%end{equation}`（漏反斜杠）都在注释里，
     # 不剥离注释就会误报"环境嵌套错序"。
     scan = mask_comments(text)
+    # \\verb 行内代码先抹掉（里面的花括号/美元符是字面量）
+    scan = _blank_inline_verb(scan)
     # 再把 verbatim 类环境内容抹掉，避免误判
-    for env in _VERBATIM_ENVS:
+    for env in (_VERBATIM_ENVS | _DISPLAY_ENVS):
         scan = re.sub(r"\\begin\s*\{" + re.escape(env) + r"\}.*?\\end\s*\{" + re.escape(env) + r"\}",
                       lambda mm: " " * len(mm.group(0)), scan, flags=re.S)
     scan = _blank_macro_definitions(scan)
@@ -955,6 +1149,16 @@ def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     #   \newenvironment{psmallmatrix}{\left(\begin{smallmatrix}}{\end{smallmatrix}\right)}
     # 会被误报"多余的右花括号 }"。
     scan = _blank_environment_definitions(scan)
+    # ⚠ 环境名后的**花括号参数**里可能含 \begin / \end，那是被当作文本展示的内容。
+    #   实证（CTAN amsldoc.tex L2106）：
+    #     \begin{error}{\begin{split} won't work here.}
+    #   参数正是在演示错误信息，里面的 \begin{split} 不是真嵌套。
+    #   用栈式配对把整段参数（含其中的 \begin）一起抹掉。
+    scan = _blank_env_arguments(scan)
+    # ⚠ doc / docstrip 宏包的**行内代码标记** |...|：
+    #   实证（CTAN amsldoc.tex L441）："using |\!\begin{aligned}| continue to work"
+    #   竖线括起来的是代码示例，不是真的环境。
+    scan = re.sub(r"\|[^|\n]{0,200}\|", lambda mm: " " * len(mm.group(0)), scan)
     # CJK 风格环境（\begin{CJK*}{GBK}{song} ... \end{CJK*}）会横跨整篇文档，
     # 里面嵌套 proof/theorem 完全是合法的。这类「壳环境」不参与配对检查。
     _SHELL_ENVS = {"CJK", "CJK*", "CJKutf8", "document", "otherlanguage", "otherlanguage*"}
@@ -1026,18 +1230,28 @@ def check_braces(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     """
     issues: List[SyntaxIssue] = []
     scan = mask_comments(text)
-    for env in _VERBATIM_ENVS:
+    # \\verb 行内代码先抹掉（里面的花括号是字面量）
+    scan = _blank_inline_verb(scan)
+    for env in (_VERBATIM_ENVS | _DISPLAY_ENVS):
         scan = re.sub(r"\\begin\s*\{" + re.escape(env) + r"\}.*?\\end\s*\{" + re.escape(env) + r"\}",
                       lambda mm: " " * len(mm.group(0)), scan, flags=re.S)
-    # \def\({...} 这类定义里的括号是"语法定义"，不是真实的括号使用：
-    # 实测 ArtMathResearch.tex 用 \def\({ \left(} 重定义定界符，会被误报。
-    scan = re.sub(r"\\(?:def|gdef|edef|xdef)\s*\\(?:[A-Za-z]+|.)\s*\{[^{}]*\}",
-                  lambda mm: " " * len(mm.group(0)), scan)
+    # \def / \newcommand 的定义体（含 [default] 里的 \left \right）都是定义语法，
+    # 不是真实的括号使用。
+    # 实证（CTAN testmath.tex L102）：
+    #   \newcommand{\eval}[2][\right]{\relax \ifx#1\right\relax \left.\fi...}
+    # 之前这里只用了针对 \def 的窄正则，导致 \newcommand 的默认参数漏网。
+    scan = _blank_macro_definitions(scan)
     # \newenvironment 的两个体里的花括号同样是定义内容，不是真实使用。
     # 实证（arXiv:2611.16819）：
     #   \newenvironment{psmallmatrix}{\left(\begin{smallmatrix}}{\end{smallmatrix}\right)}
     # 不剥离会误报"多余的右花括号 }"。
     scan = _blank_environment_definitions(scan)
+    # doc/docstrip 的行内代码标记 |...|：里面的花括号是示例文本
+    # 实证（CTAN amsldoc.tex）：| \begin{aligned} | 这类写法
+    scan = re.sub(r"\|[^|\n]{0,200}\|", lambda mm: " " * len(mm.group(0)), scan)
+    # 环境参数里也可能含 \right / \left（被展示的错误信息），一并抹掉
+    # 实证（CTAN amsldoc.tex L2312）：\begin{error}{Missing \right. inserted}
+    scan = _blank_env_arguments(scan)
 
     stack: List[Tuple[str, int]] = []
     i, n = 0, len(scan)
@@ -2697,6 +2911,19 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
             if unknown_cmd and unknown_cmd.group(1) not in _KNOWN_CMDS:
                 return CheckDetail(latex=item.latex, status="skip",
                                    reason=f"含未定义的自定义宏（\\{unknown_cmd.group(1)}），无法判定",
+                                   line=item.line, kind=item.kind)
+            # 8) array/tabular 的**列格式碎片**：>{$}  <{$}  @{}  l  c  r
+            #    实证（CTAN siunitx.tex L4130-4136）：
+            #      \begin{tabular}{ @{} >{$}l<{$} S[...] @{} }
+            #    提取时会把 `>{$}l<{$}` 之类切出一条，被判"缺操作数"。
+            #    判据（严格）：只由这些符号组成，且**至少出现一个** @ > < 或行列对齐符，
+            #    避免把 `2<3` 这种真实不等式也吞掉。
+            core = re.sub(r"\s+", "", item.latex)
+            if (core and re.fullmatch(r"[{}<>@lcrpmbXSP|!\-\d.*+]*", core)
+                    and re.search(r"[<>@]", core)
+                    and not re.fullmatch(r"-?\d+(?:\.\d+)?", core)):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="表格列格式片段（>{$}l<{$} / @{}），非公式",
                                    line=item.line, kind=item.kind)
             return CheckDetail(latex=item.latex, status="error",
                                reason="关系符缺少一侧操作数，疑似笔误",
