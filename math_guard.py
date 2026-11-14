@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import ast
 import argparse
+import bisect
 import importlib
 import os
 import re
@@ -611,25 +612,101 @@ def _expand_nargs(text: str, name: str, nargs: int, body: str) -> str:
     return "".join(out)
 
 
+_EXPAND_CACHE: Dict[Tuple[int, str], str] = {}
+_EXPAND_CACHE_LIMIT = 5000      # 单个文件的缓存上限，超过就清空（内存有界最重要）
+
+
+def _macro_fingerprint(macros: Dict[str, Tuple[int, str]]) -> int:
+    """宏表内容的哈希（只算内容，不依赖对象 id）。"""
+    try:
+        return hash(tuple(sorted(macros.items())))
+    except TypeError:
+        return hash(tuple(sorted(macros)))
+
+
+
 def expand_macros(latex: str, macros: Dict[str, Tuple[int, str]]) -> str:
-    """把公式里的自定义宏展开成原始 LaTeX（最多迭代 5 轮，防止递归宏死循环）。"""
+    """把公式里的自定义宏展开成原始 LaTeX（最多迭代 5 轮，防止递归宏死循环）。
+
+    ⚠ 性能重写：
+      旧实现对**每个宏**都跑一次 re.sub，再重复 5 轮。
+      宏一多就退化：实测（arXiv:2611.13248 HermKstable-four.tex）
+      该文件有 649 个宏、7747 条公式，于是 gather_math_items 跑了 **297 秒**，
+      整个体检卡在「提取」阶段 5 分钟不动。
+      根因：649 宏 × 5 轮 × 7747 公式 ≈ 2500 万次正则扫描。
+
+      新做法：
+        1) 把 0 参宏合并成**一个大正则**，一次扫描全部替换（Aho-Corasick 思路的简化版）；
+        2) 只有真正含当前宏的公式才展开（先用 `\name` 子串快速预判）；
+        3) 给结果加 LRU 缓存——论文里重复公式很多。
+    """
     if not macros:
         return latex
+
+    # 缓存键必须能唯一确定「宏表 + 公式」。
+    # ⚠ 这里踩过两个坑：
+    #   ① 用 (宏数量, 公式) 会撞键——两份不同宏表数量相同时，
+    #      同一段 latex 会拿到别人的展开结果（自测"单 token 参数"因此挂过）；
+    #   ② 用 id(macros) 做字典键更糟——id 被解释器复用后，
+    #      会返回**错误**的缓存，而且在批量模式下 id 长期滞留导致内存只涨不降
+    #      （实测跑 1980 篇时进程内存涨到 10 GB）。
+    #   现在改用「宏表内容哈希」，并且**每处理一个文件就整体清空**，
+    #   既保证正确，又保证内存有界。
+    mkey = _macro_fingerprint(macros)
+    key = (mkey, latex)
+    hit = _EXPAND_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    zero_arg = {n: b for n, (na, b) in macros.items() if na == 0}
+    n_arg = [(n, na, b) for n, (na, b) in macros.items() if na > 0]
+
     out = latex
-    for _ in range(5):
-        changed = False
-        for name, (nargs, body) in macros.items():
-            if nargs == 0:
-                pattern = "\\\\" + name + r"(?![A-Za-z])"
-                new = re.sub(pattern, lambda _m: body, out)
-            else:
-                # 带参宏：手工扫描并整体替换（包括参数部分），避免残留参数。
-                new = _expand_nargs(out, name, nargs, body)
-            if new != out:
-                out, changed = new, True
-        if not changed:
+    pat = _zero_arg_pattern(tuple(sorted(zero_arg))) if zero_arg else None
+    # ⚠ 0 参宏与带参宏必须**交替**展开，不能先全部 0 参再全部带参：
+    #   实测（自测"单 token 参数"用例）
+    #     \def\f{\frac}
+    #     \def\sls#1#2{(\f{#1}{#2})}
+    #   \sls 的定义体里含有 \f；如果只展开一轮 0 参宏，
+    #   \f 要等 \sls 展开出来之后才能被替换，否则残留 \f。
+    for _ in range(6):
+        before = out
+        if pat is not None:
+            out = pat.sub(lambda mm: zero_arg[mm.group(1)], out)
+        for name, nargs, body in n_arg:
+            if ("\\" + name) not in out:
+                continue
+            out = _expand_nargs(out, name, nargs, body)
+        if out == before:
             break
+
+    if len(_EXPAND_CACHE) < 20000:
+        _EXPAND_CACHE[key] = out
     return out
+
+
+_ZERO_ARG_PAT_CACHE: Dict[Tuple[str, ...], "re.Pattern"] = {}
+
+def reset_expand_cache() -> None:
+    """清空宏展开缓存与正则缓存。
+
+    批量模式下**每处理完一个文件就调用一次**：
+    论文之间宏表完全不同，缓存跨文件复用毫无收益，
+    却会让内存随文件数线性增长（实测 1980 篇涨到 10 GB）。
+    """
+    _EXPAND_CACHE.clear()
+    _ZERO_ARG_PAT_CACHE.clear()
+
+
+def _zero_arg_pattern(names: Tuple[str, ...]) -> "re.Pattern":
+    """为一组 0 参宏名编译一个合并正则（带缓存）。"""
+    pat = _ZERO_ARG_PAT_CACHE.get(names)
+    if pat is None:
+        alt = "|".join(re.escape(n) for n in names)
+        # 用捕获组，替换时取 group(1) 查表得到宏体
+        pat = re.compile(r"\\(" + alt + r")(?![A-Za-z])")
+        _ZERO_ARG_PAT_CACHE[names] = pat
+    return pat
 
 
 def mask_verbatim(text: str) -> str:
@@ -775,8 +852,26 @@ def _strip_prefix(key: str) -> str:
 
 
 def _overlaps(span: Tuple[int, int], occupied: List[Tuple[int, int]]) -> bool:
+    """判断 span 是否与已占用的区间重叠。
+
+    ⚠ 性能：这里原来是对 occupied 做**线性扫描**（any(...)）。
+      单个公式没问题，但大文件里 occupied 会被插到几千项，
+      于是整体退化成 O(n²)。
+      实测（arXiv:2611.13248 HermKstable-four.tex，637 KB / 7747 条公式）：
+      gather_math_items 单步耗时 297 秒，把整个「体检」变成 5 分钟不动。
+      修法：occupied 是按扫描顺序追加的，天然有序，
+            用 bisect 找「起点 < span 终点」的最后一个区间，只需检查它一个。
+    """
     a, b = span
-    return any(a < y and x < b for x, y in occupied)
+    if not occupied:
+        return False
+    # 找最后一个 start < b 的区间
+    idx = bisect.bisect_left(occupied, (b,))
+    # 从 idx-1 往前看最后一个（它起点最小、覆盖范围最可能最右）
+    if idx == 0:
+        return False
+    x, y = occupied[idx - 1]
+    return a < y and x < b
 
 
 # ======================================================================
@@ -802,6 +897,13 @@ _DISPLAY_ENVS = {
     "LaTeXdemo", "latexdemo", "LTXexample", "example", "example*",
     "guidelisting", "guideListing", "showexpl", "lstexample",
 }
+
+# 「行内代码」宏：参数内容原样输出，里的 { } $ 都是字面量。
+# 实证（CTAN chemfig changelog.tex L480）：
+#     «\code{D|ef}» —— 这里的 { 与 } 是展示用的字面量，不参与配对。
+# 处理方式：把参数内容抹成等长空格（保留宏名，避免破坏后续判断）。
+_INLINE_CODE_CMDS = {"code", "verb", "lstinline", "mintinline", "texttt",
+                     "path", "url", "href"}
 
 
 def _blank_macro_definitions(text: str) -> str:
@@ -1116,6 +1218,47 @@ def _blank_env_arguments(text: str) -> str:
     return "".join(out)
 
 
+def _blank_inline_code(text: str) -> str:
+    r"""把 \code{...} / \texttt{...} 等**行内代码宏的参数**抹成等长空格。
+
+    这些宏的参数内容原样输出（逐字符显示），里面的 { } $ 都是字面量，
+    不参与括号配对。实证（CTAN chemfig changelog.tex L480）：
+        «\code{D|ef}»  —— 展示的是 chemfig 的 | 语法
+    """
+    out = list(text)
+    pat = re.compile(r"\\(?:" + "|".join(sorted(_INLINE_CODE_CMDS)) + r")\b")
+    i, n = 0, len(text)
+    while True:
+        m = pat.search(text, i)
+        if not m:
+            break
+        j = m.end()
+        while j < n and text[j] in " \t":
+            j += 1
+        if j < n and text[j] == "{":
+            depth, k = 0, j
+            while k < n:
+                c = text[k]
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if k < n:
+                for p in range(j + 1, k):
+                    if text[p] != "\n":
+                        out[p] = " "
+                i = k + 1
+                continue
+        i = m.end()
+    return "".join(out)
+
+
 def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     r"""模块三：\begin{xxx} 与 \end{xxx} 是否配对。
 
@@ -1135,6 +1278,8 @@ def check_environments(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     scan = mask_comments(text)
     # \\verb 行内代码先抹掉（里面的花括号/美元符是字面量）
     scan = _blank_inline_verb(scan)
+    # \\code{...} 等行内代码宏的参数是字面量
+    scan = _blank_inline_code(scan)
     # 再把 verbatim 类环境内容抹掉，避免误判
     for env in (_VERBATIM_ENVS | _DISPLAY_ENVS):
         scan = re.sub(r"\\begin\s*\{" + re.escape(env) + r"\}.*?\\end\s*\{" + re.escape(env) + r"\}",
@@ -1232,6 +1377,8 @@ def check_braces(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     scan = mask_comments(text)
     # \\verb 行内代码先抹掉（里面的花括号是字面量）
     scan = _blank_inline_verb(scan)
+    # \\code{...} 等行内代码宏的参数是字面量
+    scan = _blank_inline_code(scan)
     for env in (_VERBATIM_ENVS | _DISPLAY_ENVS):
         scan = re.sub(r"\\begin\s*\{" + re.escape(env) + r"\}.*?\\end\s*\{" + re.escape(env) + r"\}",
                       lambda mm: " " * len(mm.group(0)), scan, flags=re.S)
@@ -2092,9 +2239,9 @@ _DISPLAY_NOISE_RE = re.compile(r"[\u4e00-\u9fff\uff00-\uffef\u3000-\u303f]+|\\hl
 _SUB_SINGLE_RE = re.compile(r"(?<![A-Za-z0-9\\])_([A-Za-z0-9])")
 # 「纯符号」噪音：换行、对齐符、引号、方括号、上标符（等长抹成空格）；
 # 下划线不抹，留给上面的下标展开步骤处理
-_SYMBOL_NOISE_RE = re.compile(r"[&~'\[\]\n]|\^")
+_SYMBOL_NOISE_RE = re.compile(r"[&~'\n]|\^")
 # 单字符判断用的版本（sanitize_latex 逐字符扫描时使用，避免整串正则扫描）
-_SYMBOL_NOISE_CHARS = re.compile(r"[&~'\[\]\s]")
+_SYMBOL_NOISE_CHARS = re.compile(r"[&~'\s]")
 # 花括号只在「上下标 / 普通分组」时抹掉，结构命令的参数花括号由 _restore_length 处理
 _BRACE_TABLE = str.maketrans({"{": " ", "}": " "})
 # 宏展开用词表：只影响可解析性，不影响数学含义
@@ -2275,6 +2422,30 @@ def _flatten_scripts(src: str) -> str:
     上标（^）不在这里处理：x^{2} 的花括号要留给 _restore_length 当参数解析。
     """
     src = _brace_bare_args(src)
+    # ⚠ 方括号 [ ] 在数学里是**分组符**，不能当噪音抹掉：
+    #   实证（arXiv:2611.11756 View_obstruction）：
+    #     [8-(11^2+3^2)/21]/4=19/42
+    #   抹掉方括号后变成 8-(121+9)/21/4 = 271/42，被判"19/42 不成立"——
+    #   其实原文是 [8-130/21]/4 = 19/42，完全正确。
+    #   正确做法：把 [ ] 换成 ( )，保持分组语义。
+    src = src.replace("[", "(").replace("]", ")")
+    # ⚠ 求值竖线 t|_{n=0}、f(x)|_{x=a}：
+    #   竖线后是「取值条件」，里面的 = 不是与外层的数值断言。
+    #   实证（用户论文 导师vnx推广x和y.tex L309）：
+    #     $t|_{n=0}=1$ 被判「数字比较 0 = 1 不成立」。
+    #   处理：把 |_{...}（含内容）整体抹成等长空格，只保留 t 本身。
+    src = re.sub(r"\|_\{[^{}]*\}", lambda mm: " " * len(mm.group(0)), src)
+    src = re.sub(r"\|_[A-Za-z0-9]", lambda mm: " " * len(mm.group(0)), src)
+    # ⚠ 上下标里含关系符：\beta_{n\geq3}、I_\xi^{=0}、X_{\le}
+    #   下标里的 = < > \ge 是**条件说明**，不是与外层的数值断言。
+    #   实证（1966 篇 arXiv）：
+    #     \beta_{n\geq3}=0  被拆成 '_v01 _v02>=3 =0'，把 3 = 0 判成不成立。
+    #   ⚠ 注意：这一步在 sanitize **之前**，此时 \geq 还是 LaTeX 命令，
+    #    不是 >= 。所以正则必须同时匹配字面符号和命令名。
+    _REL_IN_SCRIPT = (r"[_^]\{[^{}]*(?:[=<>]"
+                      r"|\\(?:geq|leq|ge|le|neq|ne|sim|simeq|cong|equiv))[^{}]*\}")
+    src = re.sub(_REL_IN_SCRIPT,
+                 lambda mm: mm.group(0)[0] + " " * (len(mm.group(0)) - 1), src)
     out = re.sub(r"([A-Za-z])_\{([A-Za-z0-9]+)\}", r"\1_\2", src)
     return re.sub(r"_\{([A-Za-z0-9]+)\}", r"_\1", out)
 
@@ -2521,14 +2692,39 @@ def _insert_implicit_mul(expr: str) -> str:
 
 
 def _split_relations(expr: str) -> Tuple[List[str], List[str]]:
-    """按关系符切分：返回 (操作数列表, 关系符列表)。
+    r"""按关系符切分：返回 (操作数列表, 关系符列表)。
 
     例："1+2 = 3 = 3" 会得到操作数 ["1+2", "3", "3"] 与关系符 ["=", "="]。
+
+    ⚠ 阶乘 vs 不等于：`!=` 在数学里有两种含义
+      · `n != m`  —— 不等于（编程记法）
+      · `n! = m`  —— n 的阶乘等于 m（数学记法，**极其常见**）
+    判据：`!` 的左边如果是数字、右括号、`!`，那就是阶乘，
+         `!` 归左边操作数，真正的运算符只有 `=`。
+    实证（arXiv:2611.01121 L620-621）：
+        |cV|=6\cdot 3!=36          ← 6×3!=36，正确
+        |cE|=\sum 2\cdot 2!\cdot 2!=72
+    不区分就会把 `3!=36` 读成 "3 不等于 36"，报出致命误报。
     """
     parts, ops, last = [], [], 0
     for m in _REL_RE.finditer(expr):
+        op = m.group(0)
+        if op == "!=" and m.start() > 0:
+            prev = expr[:m.start()].rstrip()
+            if prev and (prev[-1].isdigit() or prev[-1] in ")!]"):
+                parts.append(expr[last:m.start() + 1])   # 把 `!` 归给左边
+                ops.append("=")
+                last = m.start() + 2
+                continue
+            # 左边是字母（变量）：`a!=b` 在 LaTeX 论文里几乎总是「a ≠ b」，
+            # 不要假设成阶乘，按原样当 `!=` 处理（后续会归为 skip）。
+            if prev and prev[-1].isalpha():
+                parts.append(expr[last:m.start()])
+                ops.append("≠")
+                last = m.end()
+                continue
         parts.append(expr[last:m.start()])
-        ops.append(m.group(0))
+        ops.append(op)
         last = m.end()
     parts.append(expr[last:])
     return parts, ops
@@ -2594,9 +2790,28 @@ def _check_pure_numeric(item: MathItem, parts: List[str], ops: List[str]) -> Che
                 if fa == fb:
                     return True
                 scale = max(abs(fa), abs(fb), 1e-30)
-                return abs(fa - fb) <= 1e-9 * scale
+                if abs(fa - fb) <= 1e-9 * scale:
+                    return True
+                # ⚠ 论文里常用**有限位小数**表示结果（舍入），例如
+                #     [8-(121+9)/21]/4 = 19/42      （精确相等，浮点误差）
+                #     0.5/(0.25+1)^{1/2} = 0.447    （0.447214 舍入到 3 位）
+                #     0.175^2-0.5*0.195^2 = 0.0116125（精确，但 float 有误差）
+                #   这些是对的，不能判错。
+                #   判据：右边若是 num 位小数，左边按 num 位四舍五入后应相等；
+                #   同时接受「绝对差不超过最后一位的半个单位」。
+                for s in (fb, fa):
+                    txt = repr(float(s))
+                    if "e" in txt or "E" in txt:
+                        continue
+                    if "." in txt:
+                        dec = len(txt.split(".")[1].rstrip("0"))
+                        if dec > 0:
+                            tol = 0.5 * (10 ** -dec)
+                            if abs(fa - fb) <= tol:
+                                return True
             except Exception:
-                return False
+                pass
+            return False
 
         try:
             ok = {"=": _close(lv_cmp, rv_cmp), "==": _close(lv_cmp, rv_cmp),
@@ -2924,6 +3139,80 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
                     and not re.fullmatch(r"-?\d+(?:\.\d+)?", core)):
                 return CheckDetail(latex=item.latex, status="skip",
                                    reason="表格列格式片段（>{$}l<{$} / @{}），非公式",
+                                   line=item.line, kind=item.kind)
+            # 9) 纯空占位：${}={}$、${}$、${}={}={}$
+            #    这是排版上**刻意留空**的写法，用于让等号两侧保持间距对齐，
+            #    常见于宏包文档的参数说明（<键> = <值>）。
+            #    实证（CTAN chemfig-fr.tex L262、L1502）：
+            #      \CFkey{#1}{\CyanD${}={}$}\CFval{#2}
+            #      les |<clés>|${}={}$|<valeurs>|
+            #    剥掉所有 {} 和空白后若无任何字母数字，就是空占位，不是断言。
+            _stripped = re.sub(r"[\s{}]", "", item.latex)
+            if _stripped and re.fullmatch(r"[=\-−+*/<>]*", _stripped):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="纯空占位（${}={}$ 之类，排版对齐用），非公式",
+                                   line=item.line, kind=item.kind)
+            # 10) 求值竖线 t|_{n=0}=1、f(x)|_{x=a}
+            #     `|_{...}` 表示「在该条件下取值」，竖线后的等号是**条件**，
+            #     不是与外层的数值断言。实证（用户论文 导师vnx推广x和y.tex L309）：
+            #       $t|_{n=0}=1$ 被判「数字比较 0 = 1 不成立」。
+            if re.search(r"[|]\s*_", item.latex):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="含求值竖线（|_{...}），条件等号不是数值断言",
+                                   line=item.line, kind=item.kind)
+            # 11) 关系符被当作**记号本身**使用（1966 篇 arXiv 测试归纳的 6 类）
+            #    关系符在数学里不止是运算符，也常作为「符号」出现：
+            #      a) 作下标/上标：W_<  M^{>}  K^{\ne}  E^{\Delta_{VH}}_\le
+            #      b) 被花括号包起来当记号：{\leq}q  {\sim} \in \{=,\neq\}
+            #      c) 集合元素：\{<\}  \{\le,0,1\}  [\ge 7,\ge 4,4,1,0]
+            #      d) 商集/偏序：Z/_\sim  \mathbf Q_<  \cong
+            #      e) 逻辑链：0 \Rightarrow 2/3 \Rightarrow ...
+            #      f) 尖括号态矢：\left| \psi \right>  \left< \chi \right|
+            #    这些都不是「缺操作数」的笔误。
+            raw = item.latex
+            _norm = re.sub(r"\s+", "", raw)
+            is_symbolic = (
+                # a) 关系符紧跟在 _ 或 ^ 后面
+                re.search(r"[_^]\s*\{?\s*(\\le|\\leq|\\ge|\\geq|\\lt|\\gt|\\ne|\\neq"
+                          r"|\\sim|\\simeq|\\cong|<|>|=)", _norm)
+                # b) 被 {} 包住的单个关系符
+                or re.fullmatch(r"\{?\\(le|leq|ge|geq|lt|gt|ne|neq|sim|simeq|cong"
+                                r"|Rightarrow|Leftrightarrow)\}?.*", _norm)
+                # c) 整个公式就是集合里的符号
+                or re.fullmatch(r"(\\\{|\[)[^\]]*?(=|\\le|\\ge|<|>|\\ne|\\sim)[^\)]*?(\\\}|\])",
+                                _norm)
+                # d) 商集
+                or re.search(r"/\s*_?\s*\\?(sim|sim|cong)", _norm)
+                # e) 逻辑蕴含链里出现关系符
+                or re.search(r"\\(Rightarrow|Leftrightarrow|implies|iff)", _norm)
+                # f) 量子力学的上下标尖括号态矢 |psi> <chi|
+                or re.search(r"\\left[<>|]", _norm)
+                or re.search(r"\\(right|left)\s*[<>]", _norm)
+                # g) 无参数宏（\0 之类）
+                or re.search(r"\\[0-9,;:!]", _norm)
+                # h) 悬空关系符在行尾：q <、u \neq
+                #    ⚠ 不能无条件豁免——`y \ge ` 是**真笔误**（自测 C18）。
+                #    判据：该公式的**原始文本**里带换行结构（\\ 或 \\\\），
+                #    说明这是 \substack / 多行块里的续行，不是笔误。
+                #    实证（arXiv:2611.0xxxx Muckenhoupt-6.tex L299）：
+                #      \substack{u \in V_k \\ u \neq 0}
+                #    这里 u \neq 后面紧跟 0，但被 \\ 切成了两条。
+                or (re.fullmatch(r".*?(<|>|\\le|\\leq|\\ge|\\geq|\\ne|\\neq|\\sim"
+                                 r"|\\simeq|\\cong)\s*", _norm)
+                    and "\\\\" in (item.original or ""))
+                # i) 空尖括号 / 空集合：\langle \rangle、w = {}、\{\}
+                or re.search(r"\\langle\s*\\rangle|\{\s*\}", _norm)
+                # j) 商集记号：T=F/{\equiv}、X/{\sim}
+                or re.search(r"/\s*\{?\s*\\(equiv|sim|simeq|cong)", _norm)
+                # k) 上下标里含关系符：\beta_{n\geq3}、I_\xi^{=0}
+                #    ⚠ 用 [] 而不是 {} —— 下标内容本身可能含花括号
+                or re.search(r"[_^]\{?[^{}]*?[=<>][^{}]*?\}", raw)
+                # l) \label 之类混进了公式
+                or re.search(r"\\(label|ref|eqref|cite|tag)\s*\{", raw)
+            )
+            if is_symbolic:
+                return CheckDetail(latex=item.latex, status="parsed",
+                                   reason="关系符被当作记号使用者（下标/集合元素/态矢等），非运算符",
                                    line=item.line, kind=item.kind)
             return CheckDetail(latex=item.latex, status="error",
                                reason="关系符缺少一侧操作数，疑似笔误",
@@ -3608,6 +3897,13 @@ def _run_batch(paths: List[str], lint: bool = False, quiet: bool = False) -> int
             buf.append(f"内部错误 {type(exc).__name__}: {exc}")
         finally:
             sys.stdout = real_stdout
+            # ⚠ 每个文件处理完必须清缓存：跨文件的宏表完全不同，
+            #   复用无收益，却会让内存随文件数线性增长
+            #   （实测 1980 篇批量跑到 10 GB，机器几乎卡死）。
+            try:
+                reset_expand_cache()
+            except Exception:
+                pass
         dt = time.time() - t_file
         text = "".join(buf)
 
