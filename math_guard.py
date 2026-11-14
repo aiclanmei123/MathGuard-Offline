@@ -908,12 +908,24 @@ def check_math_punctuation(text: str, doc: TexDocument) -> List[SyntaxIssue]:
     return issues
 
 
-def syntax_check(doc: TexDocument) -> Tuple[List[SyntaxIssue], List[SyntaxIssue]]:
-    """跑全部语法检查，返回 (致命错误, 警告)。任何异常都隔离，不影响主流程。"""
+def syntax_check(doc: TexDocument, lint: bool = False) -> Tuple[List[SyntaxIssue], List[SyntaxIssue]]:
+    """跑语法检查，返回 (致命错误, 警告)。任何异常都隔离，不影响主流程。
+
+    两种模式（--lint 控制）：
+      · 默认「极速体检」：只查**会导致编译失败**的致命问题
+        （环境配对、括号配对）。这类问题工具必须报，且误报率实测为零。
+      · --lint「导师强迫症模式」：额外查排版规范（公式末尾缺标点）。
+        实测在 259 份文档上会有 309 条警告，对只想验证对错的人来说太吵，
+        所以默认关闭。
+
+    这样默认模式的输出永远是「有事才说话」，不会用格式问题淹没真正的错误。
+    """
     errors: List[SyntaxIssue] = []
     warns: List[SyntaxIssue] = []
-    for fn, bucket in ((check_environments, errors), (check_braces, errors),
-                       (check_math_punctuation, warns)):
+    checks = [(check_environments, errors), (check_braces, errors)]
+    if lint:
+        checks.append((check_math_punctuation, warns))
+    for fn, bucket in checks:
         try:
             bucket.extend(fn(doc.text, doc))
         except Exception as exc:
@@ -2464,6 +2476,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--parsub-worker", nargs=4, metavar=("TEX", "OUT", "VERIFY", "TASK_TIMEOUT"),
                    help=argparse.SUPPRESS)  # 内部使用：parsub 子进程入口
     p.add_argument("-v", "--verbose", action="store_true", help="list every math item, including skipped ones")
+    p.add_argument("--lint", action="store_true",
+                   help="also check typography (missing punctuation at end of display formulas)")
     p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     p.add_argument("--max-detail", type=int, default=12, metavar="N", help="max items shown per list (default 12)")
     p.add_argument("--debug", action="store_true", help="show full traceback on unexpected errors")
@@ -2691,7 +2705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # ---------- 语法层检查（环境配对 / 括号配对）----------
     try:
-        syn_errors, syn_warns = syntax_check(doc)
+        syn_errors, syn_warns = syntax_check(doc, lint=args.lint)
     except Exception as exc:
         syn_errors, syn_warns = [], []
         env_lines.append(f"语法检查异常已隔离（{type(exc).__name__}）")

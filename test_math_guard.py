@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """test_math_guard.py —— math_guard 自身的自测（仿照数论工作台 §13.7 纪律）。
 
@@ -218,7 +218,7 @@ def main() -> int:
         tmpf = os.path.join(tempfile.gettempdir(), "_mg_punct_test.tex")
         open(tmpf, "w", encoding="utf-8").write(text)
         d = m.read_tex(tmpf)
-        _, ws = m.syntax_check(d)
+        _, ws = m.syntax_check(d, lint=True)
         pw = [w for w in ws if w.kind == "punct"]
         ok = len(pw) == expect_n
         passed += ok
