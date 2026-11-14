@@ -1,0 +1,26 @@
+﻿\documentclass{ctexart}
+\usepackage{amsmath}
+\begin{document}
+
+\section{引言}\label{sec:intro}
+这是 $a_n = \frac{p-1}{2}$，还有 $\sin^2 x + \cos^2 x = 1$。
+
+\section{主结果}\label{sec:main}
+\begin{equation}\label{eq:main}
+  a_n = \sum_{k=0}^{n} \binom{n}{k}^{2}
+\end{equation}
+\begin{equation}\label{eq:orphan}
+  y = x^{2} + 1
+\end{equation}
+
+\begin{verbatim}
+  \begin{equation}
+    broken \$ math here
+    \end{equation}
+\end{verbatim}
+
+见 \ref{eq:main} 与 \eqref{sec:main}，还引用了 \ref{eq:notexist}。
+
+这个公式是错的：$1 = 2$。
+
+\end{document}

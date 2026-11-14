@@ -1,0 +1,35 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# PyInstaller 鎵撳寘涓棿浜х墿锛堝彲閲嶆柊鐢熸垚锛?build/
+dist/
+
+# 娴嬭瘯 / 涓存椂浜х墿
+*.log
+report.txt
+*_report.md
+
+# 缂栬緫鍣?.vscode/
+.idea/
+*.swp
+
+# 绯荤粺
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 鏈湴浜х墿
+answers/
+output/
+generated_computation.py
+generated_poster.tex
+math_guard_demo.tex
+
+# 分发产物（用 GitHub Releases 发布，不进版本库）
+MathGuard-Windows-x64.zip
+
