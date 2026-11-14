@@ -641,8 +641,7 @@ def _overlaps(span: Tuple[int, int], occupied: List[Tuple[int, int]]) -> bool:
 # 它们是最值得自动化、也最容易做到零假阳性的检查。
 
 _ENV_TOKEN_RE = re.compile(r"\\(begin|end)\s*\{([^}]*)\}")
-_LEFT_RIGHT_RE = re.compile(r"\\(left|right|bigl|bigr|Bigl|Bigr|biggl|biggr)\s*(\\[()\[\]{}|.<>]"
-                            r"|\\\{|\\\}|[()\[\]|.])")
+_LEFT_RIGHT_RE = re.compile(r"\\(left|right)\s*(\\[()\[\]{}|.<>]|\\\{|\\\}|[()\[\]|.])")
 # verbatim 类环境整体跳过（里面内容原样，不应检查括号）
 _VERBATIM_ENVS = {"verbatim", "verbatim*", "Verbatim", "lstlisting", "minted", "comment", "alltt"}
 
@@ -812,11 +811,14 @@ def check_braces(text: str, doc: TexDocument) -> List[SyntaxIssue]:
             m = _LEFT_RIGHT_RE.match(scan, i)
             if m:
                 which = m.group(1)
-                if which in ("left", "bigl", "Bigl", "biggl", "Biggl"):
+                if which == "left":
                     stack.append(("\\left", i))
-                elif which in ("right", "bigr", "Bigr", "biggr", "Biggr"):
-                    if stack and stack[-1][0] == "\\left":
-                        stack.pop()
+                else:   # right
+                    # 只弹掉最近的 \left；中间的 { 不算错（LaTeX 允许跨花括号）
+                    for k in range(len(stack) - 1, -1, -1):
+                        if stack[k][0] == "\\left":
+                            del stack[k]
+                            break
                     else:
                         f, ln = doc.origin(i)
                         issues.append(SyntaxIssue("left-right", ln,
