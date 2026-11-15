@@ -2446,6 +2446,30 @@ def _flatten_scripts(src: str) -> str:
                       r"|\\(?:geq|leq|ge|le|neq|ne|sim|simeq|cong|equiv))[^{}]*\}")
     src = re.sub(_REL_IN_SCRIPT,
                  lambda mm: mm.group(0)[0] + " " * (len(mm.group(0)) - 1), src)
+    # ⚠ 上下标里的**装饰记号**（必须在 sanitize 之前处理）：
+    #     4^{\langle1\rangle}=10,\quad 5^{\langle4\rangle}=6
+    #     实证（Higashitani L365）：⟨1⟩ 是写在上标里的**标记**，
+    #       不是「4 的 ⟨1⟩ 次方」，所以 4 与 10 之间没有数学关系。
+    #     又如 e_{{-},{=}}：下标里是两个纯记号。
+    #   ⚠ sanitize 会把 \langle 抹成空格，之后就认不出来了，故必须在此处理。
+    #   ⚠ 含**字母或数字**的下标不能抹：i=0、n\geq3 可能是外层左操作数。
+    def _blank_decor(mm) -> str:
+        inner = mm.group(0)[2:-1]
+        pad = " " * (len(mm.group(0)) - 1)
+        # ① \langle…\rangle 包裹 → 一定是装饰
+        if re.search(r"\\langle.*\\rangle", inner):
+            return mm.group(0)[0] + pad
+        # ② 形如 {-},{=} 的纯记号序列
+        if re.fullmatch(r"\s*\{[^{}]*\}(\s*,\s*\{[^{}]*\})+\s*", inner):
+            return mm.group(0)[0] + pad
+        # ③ 去掉命令名后不含字母数字 → 纯符号装饰
+        if not re.search(r"[A-Za-z0-9]", re.sub(r"\\[A-Za-z]+", "", inner)):
+            return mm.group(0)[0] + pad
+        return mm.group(0)
+
+    src = re.sub(r"[_^]\{[^{}]*\}", _blank_decor, src)
+    src = re.sub(r"[_^]\{(?:\{[^A-Za-z0-9{}]*\}(?:\s*,\s*\{[^A-Za-z0-9{}]*\})*)\}",
+                 lambda mm: mm.group(0)[0] + " " * (len(mm.group(0)) - 1), src)
     out = re.sub(r"([A-Za-z])_\{([A-Za-z0-9]+)\}", r"\1_\2", src)
     return re.sub(r"_\{([A-Za-z0-9]+)\}", r"_\1", out)
 
@@ -2783,8 +2807,14 @@ def _check_pure_numeric(item: MathItem, parts: List[str], ops: List[str]) -> Che
         #   实证（arXiv:2611.16614、2611.16278）：这两类都被误报。
         #   处理：先尽量比较精确值；若不相等再按相对误差 1e-9 判等。
         def _close(a: Any, b: Any) -> bool:
+            """判断两个数值是否相等（带浮点/舍入容差）。**始终返回真正的 bool**。
+
+            ⚠ 必须显式转 bool：sympy 的 relational / numpy 布尔在 `is False`
+              判断下与 Python False 不等，会导致「不相等」被当成「通过」。
+              实证：1=1/2 曾因此被判 ok（严重漏报）。
+            """
             try:
-                if a == b:
+                if bool(a == b):
                     return True
                 fa, fb = float(a), float(b)
                 if fa == fb:
@@ -2805,8 +2835,14 @@ def _check_pure_numeric(item: MathItem, parts: List[str], ops: List[str]) -> Che
                         continue
                     if "." in txt:
                         dec = len(txt.split(".")[1].rstrip("0"))
+                        # ⚠ dec 必须 > 0 才用「最后一位半单位」：
+                        #   `1.0` 的 dec 是 0，若照用会得到 tol = 0.5，
+                        #   于是 1 与 1/2（差正好 0.5）被判相等——
+                        #   实测 `1=1/2` 因此被漏报成 ok（严重）。
+                        #   整数（如 1210.0）不参与舍入容差，只靠上面的相对误差。
                         if dec > 0:
-                            tol = 0.5 * (10 ** -dec)
+                            tol = max(0.5 * (10 ** -dec),
+                                      1e-9 * max(abs(fa), abs(fb), 1e-30))
                             if abs(fa - fb) <= tol:
                                 return True
             except Exception:
@@ -2819,8 +2855,12 @@ def _check_pure_numeric(item: MathItem, parts: List[str], ops: List[str]) -> Che
                   "!=": not _close(lv_cmp, rv_cmp)}[op]
         except Exception:
             continue
-        if ok is False:
-            # 超长数字只在提示里截断显示，避免刷屏
+        if ok is False or ok == 0:
+            # ⚠ 必须同时检查 `ok is False` 和 `ok == 0`：
+            #   Fraction / sympy 的比较结果可能是 0/1 或 sympy 布尔，
+            #   用 `is False` 单独判断会**漏掉**这些，
+            #   导致 1=1/2 被判"通过"（实测就是这么漏的）。
+            #   超长数字只在提示里截断显示，避免刷屏
             ls = str(lv) if len(str(lv)) <= 24 else str(lv)[:10] + "…" + str(lv)[-6:]
             rs = str(rv) if len(str(rv)) <= 24 else str(rv)[:10] + "…" + str(rv)[-6:]
             return CheckDetail(latex=item.latex, status="error",
@@ -2936,6 +2976,60 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
         if hit:
             return CheckDetail(latex=item.latex, status="skip",
                                reason="含复杂结构 " + "、".join("\\" + c for c in hit[:3]),
+                               line=item.line, kind=item.kind)
+
+        # ⚠ 顶层快速排除（必须在所有分支之前）：
+        #    这些写法在真实论文里大量出现，但语义上不是数值断言。
+        #    放在这里是因为「两侧都有操作数」的式子根本进不了
+        #    「缺操作数」分支，之前的规则就是因此失效的（实测）。
+        _raw0 = item.latex
+        # a) 有限群里的**逆元**：9=5^{-1}、s=6=2^{-1}
+        #    实证（On_Distinct_Powers L619）：
+        #      "the only ratios of weight 2 are 5 and 9=5^{-1}"
+        if re.search(r"(?<![0-9.])[1-9]\d*\s*\^\s*\{?\s*-\s*1\s*\}?", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="含 x^{-1}（有限群逆元记法），不是数值倒数",
+                               line=item.line, kind=item.kind)
+        # b) `#` 基数记号：1+\#\{α∈F₂: P(α)=0\} ≥ ...
+        #    实证（HOFA++ L114）：\#\{\bx\in \Z^n: ...\}
+        if re.search(r"\\#", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="含 \\# 基数记号，不是数值运算",
+                               line=item.line, kind=item.kind)
+        # c) 上取整/下取整且带变量：\lceil\frac{4n}{5}\rceil ≥ ...
+        #    实证（cov13）—— 含变量 n，本来就无法数值判定
+        if re.search(r"\\(lceil|rceil|lfloor|rfloor)", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="含上/下取整，需代入具体值才能判定",
+                               line=item.line, kind=item.kind)
+        # d) 提取残片：}} 结尾 / \ensuremath 混进来
+        if re.search(r"\}\}\s*[=<]|\\ensuremath\{", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="公式提取残片（}} 或 \\ensuremath），非完整公式",
+                               line=item.line, kind=item.kind)
+        # e) 显式 `\label{...}` 混在公式里
+        if re.search(r"\\(label|ref|eqref|cite|tag)\s*\{", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="公式里含 \\label/\\ref 等非数学命令",
+                               line=item.line, kind=item.kind)
+        # f) 范数/绝对值记号中的数字：‖11‖²=1210
+        #    数字被 ‖·‖ 包着，它不是独立的数值，算式本身不可比。
+        #    实证（Weak_Unit_Reducibility L1029）
+        if re.search(r"\\lVert|\\rVert|\\lvert|\\rvert|\\Vert|\\vert", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="含范数/绝对值记号，数值含义不同于普通括号",
+                               line=item.line, kind=item.kind)
+        # g) 「变量 + 关系符」的标记写法（右侧确实空）：i,<  /  u \neq
+        #    ⚠ 必须要求**关系符后什么都没有**：
+        #      实证（FMCR.tex L3252）$u \neq$ {\rm R}$_0$ —— R_0 在数学模式外
+        #      而自测 C18「y \ge 」是真笔误（作者漏写右操作数），
+        #      两者写法相同，区分不了；这里按「更常见的是标记」处理，
+        #      但只在**没有花括号内容**时豁免，避免把 y \ge 也放过去。
+        #    ⚠ 自测 C18 因此改为 parsed（工具承认"没判定"，不冒充通过）。
+        if re.fullmatch(r"[A-Za-z0-9_]{1,3},?\s*(<|>|\\leq|\\geq|\\neq|\\le|\\ge|\\ne)\s*",
+                        _raw0.strip()) and not re.search(r"\}", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="变量 + 关系符的标记写法，非完整算式",
                                line=item.line, kind=item.kind)
 
         try:
@@ -3141,7 +3235,18 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
                                    reason="表格列格式片段（>{$}l<{$} / @{}），非公式",
                                    line=item.line, kind=item.kind)
             # 9) 纯空占位：${}={}$、${}$、${}={}={}$
-            #    这是排版上**刻意留空**的写法，用于让等号两侧保持间距对齐，
+            #    ⚠ 有限群里的**逆元**：9=5^{-1}、s=6=2^{-1}
+            #    （实证：On_Distinct_Powers L619、PB-2q-2 L657）
+            #      "the only ratios of weight 2 are 5 and 9=5^{-1}"
+            #      "s=6=2^{-1}"
+            #    这里的 x^{-1} 是群元素 x 的逆元，不是数值 1/x。
+            #    判据：右侧形如 <整数>^{-1} 且等号左边是整数/简单符号。
+            #    真正的数值 1/x 通常写作 \frac{1}{x} 或 1/2，极少写成 5^{-1}。
+            if re.search(r"(?<![0-9.])[1-9]\d*\s*\^\s*\{\s*-\s*1\s*\}", item.latex) \
+                    or re.search(r"(?<![0-9.])[1-9]\d*\s*\^\{?-1\}?", item.latex):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="含 x^{-1}（有限群逆元记法），不是数值倒数",
+                                   line=item.line, kind=item.kind)            #    这是排版上**刻意留空**的写法，用于让等号两侧保持间距对齐，
             #    常见于宏包文档的参数说明（<键> = <值>）。
             #    实证（CTAN chemfig-fr.tex L262、L1502）：
             #      \CFkey{#1}{\CyanD${}={}$}\CFval{#2}
@@ -3160,7 +3265,7 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
                 return CheckDetail(latex=item.latex, status="skip",
                                    reason="含求值竖线（|_{...}），条件等号不是数值断言",
                                    line=item.line, kind=item.kind)
-            # 11) 关系符被当作**记号本身**使用（1966 篇 arXiv 测试归纳的 6 类）
+            # 10) 关系符被当作**记号本身**使用（1966 篇 arXiv 测试归纳的 6 类）
             #    关系符在数学里不止是运算符，也常作为「符号」出现：
             #      a) 作下标/上标：W_<  M^{>}  K^{\ne}  E^{\Delta_{VH}}_\le
             #      b) 被花括号包起来当记号：{\leq}q  {\sim} \in \{=,\neq\}
@@ -3209,6 +3314,20 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
                 or re.search(r"[_^]\{?[^{}]*?[=<>][^{}]*?\}", raw)
                 # l) \label 之类混进了公式
                 or re.search(r"\\(label|ref|eqref|cite|tag)\s*\{", raw)
+                # m) 有限群里的**逆元**：9=5^{-1}、s=6=2^{-1}
+                #    这里的 5^{-1} 是群元素 5 的逆，不是数值 1/5。
+                #    实证（arXiv On_Distinct_Powers L619）：
+                #      For p=11, the only ratios of weight 2 are 5 and 9=5^{-1}.
+                or bool(re.search(r"\^\{\s*-\s*1\s*\}", raw))
+                # n) `#` 基数记号：1+\#\{α∈F₂: P(α)=0\} ≥ ...
+                #    实证（HOFA++ L114）：\#\{\bx\in \Z^n: ...\}
+                or bool(re.search(r"\\#", raw))
+                # o) 提取残片：}} 或 \ensuremath 混进公式
+                #    实证（conjclfinite L81、tunnel2 L939）
+                or bool(re.search(r"\}\}\s*[=<]|\\ensuremath\{", raw))
+                # p) 含 \lceil/\lfloor 且带变量，无法数值判定
+                #    实证（cov13）：\left\lceil\frac{4n}{5}\right\rceil\ge...
+                or bool(re.search(r"\\(lceil|rceil|lfloor|rfloor)", raw))
             )
             if is_symbolic:
                 return CheckDetail(latex=item.latex, status="parsed",
@@ -3226,6 +3345,22 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
                                reason=f"关系符过多（{len(ops)} 个），超出基础验证范围",
                                line=item.line, kind=item.kind)
         long_operand = any(len(p) > MAX_OPERAND_LEN for p in parts)
+        # ⚠ 幂的规模限制：`2**9**24` 这种链式幂会被 Python 右结合解析成
+        #   2**(9**24)，sympy 用 378 秒、12 GB 内存去算一个天文数字。
+        #   实证（arXiv:2611.11250 Suragan L574）：
+        #     \frac{2\,9^{24}}{24!(3)_{24}}  —— 本意是 2·9²⁴ / (24!·(3)₂₄)，
+        #     被误读成 2^(9^24)，直接把机器拖垮。
+        #   处理：出现「连续幂」或「指数过大」时整体跳过。
+        for _p in parts:
+            if re.search(r"\*\*\s*\d+\s*\*\*", _p):
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason="含链式幂（a^b^c），数值规模无法界定",
+                                   line=item.line, kind=item.kind)
+            _big = re.search(r"\*\*\s*(\d{1,3})\b", _p)
+            if _big and int(_big.group(1)) > 30:
+                return CheckDetail(latex=item.latex, status="skip",
+                                   reason=f"指数过大（^{_big.group(1)}），超出基础验证范围",
+                                   line=item.line, kind=item.kind)
         digits_only = all(re.fullmatch(r"[\s0-9.+\-*/()^eE]*", p) for p in parts)
         if long_operand and not digits_only:
             return CheckDetail(latex=item.latex, status="skip",
@@ -3314,9 +3449,41 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
                 if nxt is None:
                     continue
             n_critical += 1
+
+            def _numclose(a, b) -> bool:
+                """sympy 数值比较的容差版。
+
+                ⚠ sympy 的 `a == b` 对 Float 是**精确位比较**：
+                  实证（arXiv:2611.xxxxx PIMOT_multi L2239）
+                    1*0.175^2-0.5*0.195^2 = 0.0116125
+                  左边是 0.011612499999999994，右边 0.0116125，
+                  Float 比较判不等 → 正确算式被判错。
+                  处理：两者都是「纯数值」（无自由符号）时，
+                  改用浮点相对误差 1e-9 判等。
+                """
+                try:
+                    if a == b:
+                        return True
+                    if getattr(a, "free_symbols", None) or getattr(b, "free_symbols", None):
+                        return False
+                    fa, fb = float(a), float(b)
+                    if fa == fb:
+                        return True
+                    return abs(fa - fb) <= 1e-9 * max(abs(fa), abs(fb), 1e-30)
+                except Exception:
+                    return a == b
+
             try:
-                ok = {"=": lv == rv, "==": lv == rv, "<=": lv <= rv,
-                      ">=": lv >= rv, "!=": lv != rv}[op]
+                if op in ("=", "=="):
+                    ok = _numclose(lv, rv)
+                elif op == "!=":
+                    ok = not _numclose(lv, rv)
+                elif op == "<=":
+                    ok = (lv <= rv) or _numclose(lv, rv)
+                elif op == ">=":
+                    ok = (lv >= rv) or _numclose(lv, rv)
+                else:
+                    ok = True
             except Exception:
                 continue
             if ok is False:
