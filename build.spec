@@ -1,14 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller 打包配置（onedir），产出两个 exe 共用一个 _internal 目录。
+"""PyInstaller 打包配置 —— 产出两个文件，职责分明。
 
-产物目录 dist/math_guard/：
-    math_guard.exe        命令行版
-    MathGuard-GUI.exe     图形界面版（双击运行，拖拽即用）
-    example.tex           示例
-    _internal/            两个 exe 共用的运行库
+用户反馈「文件夹里有两个 exe，小写的那个双击打不开」。
+问题不是"有两个程序"，而是"两个都叫 exe，看不出区别"。
 
-为什么用 onedir：onefile 每次运行都要解压到临时目录，实测在本机出现
-"Could not create temporary directory!"（临时目录受限/杀软拦截时不可靠）。
+现在的方案：
+  · MathGuard.exe            GUI 版（console=False），双击打开窗口
+  · 命令行版.bat             指向同一个程序的批处理，双击会让你输入路径
+
+关键：**两个入口共用一份 _internal**，体积几乎不增加。
+MathGuard.exe 检测到命令行参数时会走 math_guard.main()，像命令行版一样工作。
+
+打包模式：onedir（不是 onefile）
+  onefile 每次运行都要解压到临时目录，实测出现
+  "Could not create temporary directory!"（临时目录受限/杀软拦截）。
 """
 import os
 
@@ -22,52 +27,24 @@ hiddenimports = [
     "sympy.core",
     "sympy.functions",
     "sympy.simplify",
+    "tkinter", "tkinter.ttk", "tkinter.filedialog",
+    "tkinter.messagebox", "tkinter.font",
 ]
 hiddenimports += [m for m in collect_submodules("sympy")
                   if ".tests" not in m and not m.startswith("sympy.testing")]
-# GUI 版需要 tkinter（不能像旧配置那样排除）
-hiddenimports += ["tkinter", "tkinter.ttk", "tkinter.filedialog",
-                  "tkinter.messagebox", "tkinter.font"]
 
 EXCLUDES = [
-    # ---- 体积大头（实测 _internal 里合计约 40 MB）----
-    # PIL / lxml：本工具完全用不到，只是被某些库间接拉进来的。
     "PIL", "Pillow", "lxml", "yaml",
-    # python-flint：sympy 的可选整数后端，打包后占 21.5 MB
-    #   （python_flint.libs 16.2 + flint 5.2）。
-    #   实测换成纯 python 后端**反而更快**、结果完全一致：
-    #       flint  : 提取 2488 条，合计 1.59 s
-    #       python : 提取 2488 条，合计 1.50 s
-    #   原因：本工具 99% 的工作是纯数字比较，用不上 flint 的大整数加速。
+    # python-flint：sympy 可选整数后端，占 21.5 MB；
+    # 实测换成纯 python 后端**反而更快**（1.50s vs 1.59s）。
     "flint", "python_flint", "gmpy2",
-    # OpenSSL：只有 requests/urllib 的 https 才需要；本工具完全离线。
-    #   （"完全离线"是产品承诺，砍掉它同时也是在代码层面兑现承诺）
-    # 注：不在此处排除 ssl —— tkinter/urllib 的导入链上可能出现它，留着更安全。
-    # ---- 科学计算与测试框架 ----
     "parsub", "numpy", "scipy", "matplotlib", "pandas",
     "openpyxl", "fastapi", "uvicorn", "starlette", "typer", "rich",
     "IPython", "pytest", "PyQt5", "PySide2", "PySide6",
     "mpmath.tests", "sympy.testing",
 ]
 
-a1 = Analysis(
-    ["math_guard.py"],
-    pathex=[os.getcwd()],
-    binaries=[], datas=[],
-    hiddenimports=hiddenimports,
-    hookspath=[], hooksconfig={}, runtime_hooks=[],
-    excludes=EXCLUDES,
-    noarchive=False, optimize=0,
-)
-pyz1 = PYZ(a1.pure)
-
-exe_cli = EXE(pyz1, a1.scripts, [],
-              exclude_binaries=True,
-              name="math_guard",
-              console=True, debug=False, strip=False, upx=False,
-              bootloader_ignore_signals=False)
-
-a2 = Analysis(
+a = Analysis(
     ["math_guard_gui.py"],
     pathex=[os.getcwd()],
     binaries=[], datas=[],
@@ -76,17 +53,30 @@ a2 = Analysis(
     excludes=EXCLUDES,
     noarchive=False, optimize=0,
 )
-pyz2 = PYZ(a2.pure)
+pyz = PYZ(a.pure)
 
-exe_gui = EXE(pyz2, a2.scripts, [],
-              exclude_binaries=True,
-              name="MathGuard-GUI",
-              console=False, debug=False, strip=False, upx=False,
-              bootloader_ignore_signals=False)
+# GUI 入口：双击无黑框；带参数时在内部转命令行模式
+exe = EXE(
+    pyz, a.scripts, [],
+    exclude_binaries=True,
+    name="MathGuard",
+    console=False,
+    debug=False, strip=False, upx=False,
+    bootloader_ignore_signals=False,
+)
+
+# 命令行入口：带控制台，能看到输出
+exe_cli = EXE(
+    pyz, a.scripts, [],
+    exclude_binaries=True,
+    name="MathGuard-命令行",
+    console=True,
+    debug=False, strip=False, upx=False,
+    bootloader_ignore_signals=False,
+)
 
 coll = COLLECT(
-    exe_cli, a1.binaries, a1.datas,
-    exe_gui, a2.binaries, a2.datas,
+    exe, exe_cli, a.binaries, a.datas,
     strip=False, upx=False,
-    name="math_guard",
+    name="MathGuard",
 )

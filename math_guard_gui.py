@@ -529,6 +529,22 @@ class App:
 
 
 def main() -> None:
+    # ⚠ 带命令行参数启动时，切换成**命令行模式**（不开窗口）。
+    #   原因：打包后只发布了一个 MathGuard.exe（GUI），
+    #   用户在 cmd 里想批量跑却没有可用入口——实测 `MathGuard.exe x.tex`
+    #   会直接挂起（GUI 版没有控制台输出）。
+    #   这里把参数原样转交给 math_guard.main()，让它像命令行版一样工作。
+    import sys as _sys
+    argv = _sys.argv[1:]
+    if argv:
+        try:
+            import math_guard as _mg
+        except Exception as exc:
+            print(f"无法加载检查模块：{exc}")
+            raise SystemExit(2)
+        code = _mg.main(argv)
+        raise SystemExit(code)
+
     root = tk.Tk()
     App(root)
     root.mainloop()

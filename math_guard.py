@@ -227,6 +227,7 @@ class CheckDetail:
     variables: int = 0
     relations: int = 0
     critical: int = 0
+    suggestion: str = ""    # 具体修改建议（给人看的「应该改成什么」）
 
 
 @dataclass
@@ -2422,6 +2423,16 @@ def _flatten_scripts(src: str) -> str:
     上标（^）不在这里处理：x^{2} 的花括号要留给 _restore_length 当参数解析。
     """
     src = _brace_bare_args(src)
+    # ⚠ 对数底数：\log_{2}8 → log(2,8)
+    #   必须在 sanitize **之前**处理：sanitize 会把 \log_{2}8 变成 _log_28，
+    #   之后再还原成变量占位符 _v01 就丢失了底数与真数。
+    #   实证（用户反馈）：\log_2 8=3 曾判成"只含符号"。
+    src = re.sub(r"\\log\s*_\s*\{?\s*(\d+(?:\.\d+)?)\s*\}?\s*(\d+(?:\.\d+)?)",
+                 r"log(\1,\2)", src)
+    src = re.sub(r"\\log\s*_\s*\{?\s*(\d+(?:\.\d+)?)\s*\}?\s*\{([0-9.]+)\}",
+                 r"log(\1,\2)", src)
+    # 无底数的 \log x 也支持（自然对数，与多数论文一致）
+    src = re.sub(r"\\log\s*(\d+(?:\.\d+)?)(?!\s*[A-Za-z])", r"log(\1)", src)
     # ⚠ 方括号 [ ] 在数学里是**分组符**，不能当噪音抹掉：
     #   实证（arXiv:2611.11756 View_obstruction）：
     #     [8-(11^2+3^2)/21]/4=19/42
@@ -2604,6 +2615,115 @@ def _restore_length(sanitized: str) -> str:
     return re.sub(r"(?<![\w\\])[A-Za-z_]\w*", repl, work)
 
 
+def _suffix_factorial(text: str) -> str:
+    """把数学里的后缀阶乘 n! 转成 factorial(n)。
+
+    ⚠ Python 语法里 `!` 只有 `!=`，没有后缀阶乘。
+      实证（用户反馈）：5!=120 被判成"只含符号"。
+    规则：数字/右括号 紧跟 `!`（后面不是 =）→ fac(···)
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "!" and (i + 1 >= n or text[i + 1] != "="):
+            # 往前找操作数：数字串，或配对的右括号
+            j = len(out) - 1
+            # 跳过尾部空格
+            while j >= 0 and out[j] == " ":
+                j -= 1
+            if j < 0:
+                out.append(c)
+                i += 1
+                continue
+            if out[j] == ")":
+                depth = 0
+                k = j
+                while k >= 0:
+                    if out[k] == ")":
+                        depth += 1
+                    elif out[k] == "(":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    k -= 1
+                if k >= 0:
+                    head = "".join(out[:k])
+                    body = "".join(out[k:j + 1])
+                    out = list(head + "factorial(" + body + ")")
+                    i += 1
+                    continue
+            elif out[j].isdigit():
+                k = j
+                while k >= 0 and (out[k].isdigit() or out[k] == "."):
+                    k -= 1
+                head = "".join(out[:k + 1])
+                body = "".join(out[k + 1:j + 1])
+                out = list(head + "factorial(" + body + ")")
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _safe_sqrt(v: Any) -> Any:
+    r"""安全开平方：完全平方返回精确整数/分数，否则返回浮点。
+
+    \\sqrt{16}=4 应判等；\\sqrt{2}=1.414 应判近似。
+    """
+    from fractions import Fraction
+    f = Fraction(v).limit_denominator(10 ** 9) if not isinstance(v, int) else Fraction(v)
+    try:
+        # 完全平方：分子分母都能开尽
+        n, d = f.numerator, f.denominator
+        rn, rd = int(round(n ** 0.5)), int(round(d ** 0.5))
+        if rn * rn == n and rd * rd == d:
+            return Fraction(rn, rd)
+    except Exception:
+        pass
+    try:
+        return float(float(v) ** 0.5)
+    except Exception:
+        raise ValueError("sqrt 参数非法")
+
+
+def _safe_binomial(n: Any, k: Any) -> Any:
+    """二项式系数 C(n,k)，n,k 必须是非负整数。"""
+    from math import comb
+    try:
+        ni, ki = int(n), int(k)
+    except Exception:
+        raise ValueError("binomial 参数非整数")
+    if ni < 0 or ki < 0 or ki > ni or ni > 5000:
+        raise ValueError("binomial 参数越界")
+    return comb(ni, ki)
+
+
+def _safe_factorial(n: Any) -> Any:
+    """阶乘 n!，n 必须是非负整数且不超过 2000（防止爆炸）。"""
+    from math import factorial
+    try:
+        ni = int(n)
+    except Exception:
+        raise ValueError("阶乘参数非整数")
+    if ni < 0 or ni > 2000:
+        raise ValueError("阶乘参数越界")
+    return factorial(ni)
+
+
+def _safe_log(args: list) -> Any:
+    """对数：log(x) 以 e 为底，log(b, x) 以 b 为底（与 LaTeX 的 \\log_b x 对应）。"""
+    import math
+    try:
+        if len(args) == 1:
+            return math.log(float(args[0]))
+        return math.log(float(args[1]), float(args[0]))
+    except Exception:
+        raise ValueError("log 参数非法")
+
+
 def _safe_eval_num(expr: str) -> Optional[Any]:
     """安全地求一个「纯数字表达式」的值（2+2、3*4、2**10、100/4、-5、1.5 ...）。
 
@@ -2625,6 +2745,24 @@ def _safe_eval_num(expr: str) -> Optional[Any]:
             if isinstance(node.value, bool) or not isinstance(node.value, (int, float, complex)):
                 raise ValueError("非数字常量")
             return node.value
+        # ⚠ 白名单函数调用：sqrt(...)、binomial(a,b)、factorial(n)、log(...)
+        #   用户反馈"测了几个就报结果"，实测 \sqrt{16}=4、\binom{5}{2}=10、
+        #   \log_2 8=3 这三类**本来能算**却被判成"只含符号"。
+        #   这里只放行这几个**纯数值函数**，仍然不允许任意名字/属性/调用。
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else (
+                fn.attr if isinstance(fn, ast.Attribute) else "")
+            args = [ev(a) for a in node.args]
+            if name == "sqrt" and len(args) == 1:
+                return _safe_sqrt(args[0])
+            if name in ("binomial", "binom") and len(args) == 2:
+                return _safe_binomial(args[0], args[1])
+            if name in ("factorial", "fact") and len(args) == 1:
+                return _safe_factorial(args[0])
+            if name == "log" and 1 <= len(args) <= 2:
+                return _safe_log(args)
+            raise ValueError("不允许的函数：" + name)
         if isinstance(node, ast.UnaryOp):
             v = ev(node.operand)
             if isinstance(node.op, ast.USub):
@@ -2765,6 +2903,11 @@ def _check_pure_numeric(item: MathItem, parts: List[str], ops: List[str]) -> Che
 
     def lit(piece: str) -> Optional[Any]:
         text = _insert_implicit_mul(re.sub(r"\s+", "", piece)).replace("^", "**")
+        # ⚠ 阶乘后缀 n! 转成 factorial(n)（Python 不认后缀 !）
+        #   实证：5!=120 曾被判"只含符号"。
+        text = _suffix_factorial(text)
+        # ⚠ \log_2 8 的底数会被 sanitize 成 _log_28 之类，还原成 log(2,8)
+        text = re.sub(r"_?\blog_(\d+)(\d+(?:\.\d+)?)", r"log(\1,\2)", text)
         scale = 1
         if text.endswith("‰"):
             text = text[:-1]
@@ -3532,7 +3675,15 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
                 return CheckDetail(latex=item.latex, status="skip",
                                    reason=f"指数过大（^{_big.group(1)}），超出基础验证范围",
                                    line=item.line, kind=item.kind)
-        digits_only = all(re.fullmatch(r"[\s0-9.+\-*/()^eE]*", p) for p in parts)
+        # ⚠ 纯数字判定要接受白名单函数名（sqrt/binomial/factorial/log），
+        #   否则 \sqrt{16}=4、\binom{5}{2}=10 会被当成含符号跳过。
+        _DIGITS_RE = r"[\s0-9.+\-*/()^eE!,]*|(?:sqrt|binomial|binom|factorial|log)[\s0-9.+\-*/()^eE!,]*"
+        digits_only = all(
+            re.fullmatch(r"[\s0-9.+\-*/()^eE!,]*", p.strip())
+            or re.fullmatch(
+                r"(?:(?:sqrt|binomial|binom|factorial|log)[\s(]?[\s0-9.+\-*/()^eE!,]*)",
+                p.strip())
+            for p in parts)
         if long_operand and not digits_only:
             return CheckDetail(latex=item.latex, status="skip",
                                reason="单个表达式过长，超出基础验证范围",
@@ -3762,6 +3913,95 @@ def _status_icon(status: str) -> str:
             "parsed": f"{S.YELLOW}[≈]{S.RESET}"}.get(status, f"{S.DIM}[–]{S.RESET}")
 
 
+def _make_suggestion(detail: "CheckDetail", formulas: "MockParSubResult") -> str:
+    """为一条报错生成**具体的修改建议**（用户要求：每一项都要说清楚怎么改）。
+
+    不同类型给不同建议，绝不空着。
+    """
+    latex = (detail.latex or "").strip()
+    reason = detail.reason or ""
+
+    # ---- 空参数类：给出补全后的写法 ----
+    for cmd, cn in (("frac", "分式"), ("dfrac", "分式"), ("tfrac", "分式"),
+                    ("binom", "二项式系数"), ("dbinom", "二项式系数"),
+                    ("sqrt", "根号")):
+        m = re.search(r"\\" + cmd + r"\b", latex)
+        if m and "参数为空" in reason:
+            if "的第 2 个参数" in reason:
+                return (f"分母缺失。补上分母：\\{cmd}{{...}}{{<分母>}}；"
+                        f"若这一项本来就不完整，整处删掉或改用 \\ldots 占位。")
+            if "的第 1 个参数" in reason:
+                return (f"{cn}的第一个参数缺失。补上：\\{cmd}{{<分子/被开方数>}}"
+                        f"{{...}}。")
+            return f"{cn}有参数为空，补全后重新编译。"
+
+    # ---- 占位符残骸 ----
+    if "占位符" in reason:
+        got = re.search(r"\\cdot|\\ldots|\\dots|\\,|\\ ", latex)
+        return ("这里像是未完成的草稿（只写了占位符 \\cdot 之类）。"
+                "要么补上真正的公式，要么整行删掉。")
+
+    # ---- 数值不成立：算出正确答案 ----
+    if "不成立" in reason:
+        m = re.search(r"数字比较\s+(\S+)\s*(=|<=|>=|!=)\s*(\S+)\s*不成立", reason)
+        if m:
+            lhs, op, rhs = m.group(1), m.group(2), m.group(3)
+            return (f"等式不成立：左边算得 {lhs}，右边写的是 {rhs}。"
+                    f"请核对数字（可能是抄写笔误），或检查是否漏了取模/单位/变量含义。")
+        return "数值关系不成立，请核对这一行的数字。"
+
+    # ---- 关系符缺操作数 ----
+    if "缺操作数" in reason or "缺少一侧操作数" in reason:
+        return ("关系符有一侧是空的。检查是否漏写、或公式被 $...$ 切断成两段"
+                "（右半边跑到了数学模式外面）。")
+
+    # ---- 超时/规模 ----
+    if "超时" in reason or "过大" in reason:
+        return "这条公式超出工具的计算范围（不是错误），已跳过。"
+
+    # ---- 兜底 ----
+    return "请人工核对这一行。"
+
+
+def _make_structure_suggestion(issue: "SyntaxIssue") -> str:
+    """为一条结构问题生成具体建议。"""
+    msg = getattr(issue, "message", "") or ""
+    # 空参数：按命令名给出精确写法
+    if "参数为空" in msg or "参数是占位符" in msg:
+        for cmd, form, cn in (
+            ("frac", r"\frac{分子}{分母}", "分式"),
+            ("dfrac", r"\dfrac{分子}{分母}", "分式"),
+            ("tfrac", r"\tfrac{分子}{分母}", "分式"),
+            ("binom", r"\binom{n}{k}", "二项式系数"),
+            ("dbinom", r"\dbinom{n}{k}", "二项式系数"),
+            ("sqrt", r"\sqrt{被开方数}", "根号"),
+        ):
+            if "\\" + cmd in msg:
+                which = ""
+                if "第 1 个" in msg:
+                    which = "（第 1 个参数=上面的「分子」）"
+                elif "第 2 个" in msg:
+                    which = "（第 2 个参数=上面的「分母」）"
+                if "占位符" in msg:
+                    return (f"这里只有 {cmd} 的占位符，像是没写完。"
+                            f"补成 {form}{which}，或整处删除。")
+                return f"缺参数{which}。正确写法：{form}"
+        return "补全该命令缺的参数；若该命令本来多余，整处删掉。"
+    if "没有闭合" in msg or "不匹配" in msg or "没有对应" in msg:
+        return "检查 \\begin/\\end 名称是否一致、顺序是否嵌套正确，或补上缺失的 }。"
+    if "多余的右花括号" in msg:
+        return "这个 } 没有对应的 {，删掉它，或在左边补上配对的 {。"
+    if "\\left" in msg or "\\right" in msg:
+        return "每个 \\left 必须有配对的 \\right；只在单侧要竖线时用 \\right. 。"
+    if "孤儿标签" in msg:
+        return "这个 label 从没被 \\ref 引用过。删掉它，或在正文里引用一次。"
+    if "未定义引用" in msg:
+        return "引用的 label 不存在。检查拼写，或补上对应的 \\label{...}。"
+    if "多出的" in msg:
+        return "多了一个 \\end。检查是不是重复写了，或对应的 \\begin 被删掉了。"
+    return "请人工核对。"
+
+
 def build_report(info_file: FileInfo, structure: StructureReport, formulas: MockParSubResult,
                  env_lines: List[str], verbose: bool, max_detail: int) -> Tuple[str, int, int]:
     """渲染报告。返回 (报告文本, 结构问题数, 数学错误数)。
@@ -3771,6 +4011,11 @@ def build_report(info_file: FileInfo, structure: StructureReport, formulas: Mock
     """
     out: List[str] = []
     add = out.append
+    # ⚠ max_detail <= 0 表示**全部列出，不省略**。
+    #   用户反馈：报错一省略就看不到全部问题，必须一项一项列出来，
+    #   哪怕几百项也不能省。默认就是 0（全显示）。
+    if max_detail is None or max_detail <= 0:
+        max_detail = 10 ** 9
     n_ok, n_skip, n_err = formulas.verified, formulas.skipped, formulas.errors
     # 语法错误也算"结构问题"：它同样会阻止编译成功
     n_struct = (len(structure.orphans) + len(structure.undefined)
@@ -3823,6 +4068,12 @@ def build_report(info_file: FileInfo, structure: StructureReport, formulas: Mock
         for e in syn[:max_detail]:
             loc = f"{e.file}:{e.line}" if e.file else f"L{e.line}"
             add(f"    {loc:<24} {e.message}")
+            try:
+                sug = _make_structure_suggestion(e)
+            except Exception:
+                sug = ""
+            if sug:
+                add(f"      {S.CYAN}建议: {sug}{S.RESET}")
         if len(syn) > max_detail:
             add(f"    {S.DIM}… 其余 {len(syn) - max_detail} 处已省略{S.RESET}")
         add("")
@@ -3888,6 +4139,13 @@ def build_report(info_file: FileInfo, structure: StructureReport, formulas: Mock
         for d in [d for d in formulas.details if d.status == "error"][:max_detail]:
             add(f"    L{d.line:<5} {_status_icon(d.status)} {_preview(d.latex, 70)}")
             add(f"           {S.RED}-> {d.reason}{S.RESET}")
+            # 每条错误都给出**具体修改建议**（不能只报错不告诉怎么改）
+            try:
+                sug = d.suggestion or _make_suggestion(d, formulas)
+            except Exception:
+                sug = ""
+            if sug:
+                add(f"           {S.CYAN}建议: {sug}{S.RESET}")
         add("")
 
     if n_ok:
@@ -3968,7 +4226,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lint", action="store_true",
                    help="also check typography (missing punctuation at end of display formulas)")
     p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
-    p.add_argument("--max-detail", type=int, default=12, metavar="N", help="max items shown per list (default 12)")
+    p.add_argument("--max-detail", type=int, default=0, metavar="N",
+                   help="max items shown per list (0 = show all, default 0)")
     p.add_argument("--debug", action="store_true", help="show full traceback on unexpected errors")
     p.add_argument("--version", action="version", version=f"math_guard {__version__}")
     return p
@@ -4109,7 +4368,7 @@ def _run_demo() -> int:
     with open(path, "w", encoding="utf-8") as f:
         f.write(_DEMO_TEX)
     print(f"{S.DIM}已生成示例文件：{path}{S.RESET}\n")
-    return main([path, "--max-detail", "20"])
+    return main([path])
 
 
 def _count_paragraphs(text: str) -> int:
@@ -4227,7 +4486,7 @@ def _run_batch(paths: List[str], lint: bool = False, quiet: bool = False) -> int
         try:
             sys.stdout = _TeeWriter(buf)
             code = main([str(path)] + (["--lint"] if lint else [])
-                        + ["--no-color", "--max-detail", "4"])
+                        + ["--no-color"])
         except SystemExit as e:
             code = int(e.code) if isinstance(e.code, int) else EXIT_INTERNAL
         except Exception as exc:
@@ -4518,8 +4777,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         info = FileInfo(str(path), 0, 0, "?", "?", 0, 0)
 
     try:
+        # ⚠ 不要用 max(1, ...)：0 的语义是「全部列出」，
+        #   被强制成 1 就变成只显示第一条（用户反馈的正是这个现象）。
         report, n_struct, n_math = build_report(info, structure, formulas, env_lines,
-                                                args.verbose, max(1, args.max_detail))
+                                                args.verbose, args.max_detail)
     except Exception as exc:
         print(f"{S.RED}✘ 报告渲染失败，以下为降级输出{S.RESET}：{_friendly_error(exc)}")
         print(f"孤儿标签 {len(structure.orphans)}，未定义引用 {len(structure.undefined)}，"

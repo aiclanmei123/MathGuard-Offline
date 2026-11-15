@@ -1,0 +1,98 @@
+% ============================================================
+%  example_hard.tex  ——  挑战示例：真实论文里的"暗坑"
+%  用法：math_guard.exe example_hard.tex
+%
+%  这里的每一处都来自真实论文（arXiv / CTAN / 用户稿件），
+%  而且是"编译 0 报错、日志 0 错误、PDF 印出来是错的"那种。
+% ============================================================
+\documentclass{article}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+
+% 自定义宏：工具会自动展开
+\newcommand{\hf}{\frac{1}{2}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\eqd}{\overset{d}{=}}
+\def\sls#1#2{(\frac{#1}{#2})}
+
+\begin{document}
+
+\section{真实案例：55 页论文里的空分母}
+
+% 这处的原文是：
+%   {}_{2}F_{1}\Bigl(\hf,\hf;1;\frac{-(e^{-x}-1)^{2}}{}\Bigr)
+% xelatex 编译 exit=0，日志 0 错误，PDF 第 38 页印成一道空横线。
+% 只有肉眼盯着看才看得出来。
+\[
+{}_{2}F_{1}\Bigl(\hf,\hf;1;4e^{x}(1-e^{x})\Bigr)=(2e^{x}-1)^{-1}
+{}_{2}F_{1}\Bigl(\hf,\hf;1;\frac{-(e^{-x}-1)^{2}}{(e^{x}-1)^{2}}\Bigr)
+\]
+% 上面这个已经修好了；把分母改成空的就是原文的状态。
+
+\section{自定义宏展开}
+
+% \def 定义的带参宏：展开后是 (1+\sqrt{-7})/2
+\[ \sls{1+\sqrt{-7}}{2}2^{24} = 2^{47}+2^{23}\sqrt{-7} \]
+
+% 无参宏
+\[ \hf+\hf=1 \]
+
+\section{各种"看起来像错、其实没错"的写法}
+
+% 分式等于小数（浮点精度陷阱）
+\[ \frac{1}{200}=0.005 \]
+
+% 百分比
+\[ \frac{26}{500}=5.2\% \]
+
+% 括号幂（曾被误判）
+\[ 5(5^{2}-1)=120 \]
+
+% 幂是表达式
+\[ 2^{4-1}=8 \]
+
+% 方括号做分组
+\[ \frac{8-(11^{2}+3^{2})/21}{4}=\frac{19}{42} \]
+
+% 有限小数舍入
+\[ \frac{0.5}{(0.25+1)^{1/2}}=0.447 \]
+
+% 浮点累积误差
+\[ 1\times 0.175^{2}-0.5\times 0.195^{2}=0.0116125 \]
+
+\section{真错误（这些确实要报）}
+
+% 链式等式里第二段算错
+\[ r(4)=16-6=11 \]
+
+% 整数与分数混算
+\[ 1=\frac{1}{2} \]
+
+% 不等式方向错
+\[ 40\ge 6\cdot 20 \]
+
+\section{环境与引用}
+
+\begin{equation}\label{eq:ok}
+  E = mc^{2}
+\end{equation}
+
+引用 \eqref{eq:ok} 是正常的；引用 \eqref{eq:missing} 会报未定义。
+
+% 环境不配对：begin 是 equation，end 是 align
+\begin{equation}
+  y = x + 1
+\end{align}
+
+\section{无法验证（工具会承认）}
+
+% 概率论记号
+\[ X_{n}\eqd N(0,1) \]
+
+% 矩阵
+\[ A=\begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix} \]
+
+% 纯符号恒等式
+\[ (a+b)^{2}=a^{2}+2ab+b^{2} \]
+
+\end{document}

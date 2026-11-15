@@ -1,0 +1,257 @@
+\documentclass[11pt,UTF8]{ctexart}
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{colortbl}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{mdframed}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black}
+\setlist{nosep,leftmargin=1.6em}
+
+\newmdenv[backgroundcolor=red!5,linecolor=red!60!black,linewidth=0.6pt,
+  skipabove=6pt,skipbelow=6pt,innertopmargin=5pt,innerbottommargin=5pt]{warnbox}
+\newmdenv[backgroundcolor=blue!4,linecolor=blue!50!black,linewidth=0.6pt,
+  skipabove=6pt,skipbelow=6pt,innertopmargin=5pt,innerbottommargin=5pt]{notebox}
+
+\title{\textbf{MathGuard 使用说明}\\[4pt]
+\large 论文 LaTeX 体检工具 \textperiodcentered\ 完全离线版}
+\author{}
+\date{版本 1.0.0}
+
+\begin{document}
+\maketitle
+\vspace{-1.5em}
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{\centering
+一个\textbf{完全离线}的 LaTeX 检查工具。不联网、不上传数据、不修改你的文件。\\
+它检查的是「编译器不报错、但印出来是错的」那类问题。}}
+\end{center}
+
+\section{怎么用（三步）}
+\begin{enumerate}
+\item 解压本文件夹到任意位置
+\item 双击 \texttt{MathGuard.exe}
+\item 把 \texttt{.tex} 文件或整个论文文件夹\textbf{拖进窗口}，点【开始体检】
+\end{enumerate}
+
+结果会逐条列在窗口里。\textbf{点报告里的 \texttt{文件:行号}}，会用你的编辑器
+（VS Code / Notepad++ / Sublime / TeXstudio / WinEdt）直接跳到那一行。
+
+\section*{关于文件夹里的两个程序}
+\begin{center}
+\begin{tabular}{@{}llp{7.5cm}@{}}
+\toprule
+文件 & 用法 & 说明\\
+\midrule
+\textbf{\texttt{MathGuard.exe}} & \textbf{双击} & 图形界面。\textbf{日常用这个就够了}\\
+\texttt{MathGuard-命令行.exe} & \texttt{cmd} & 命令行版，批处理/写脚本时用\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{notebox}
+两个程序\textbf{共用一份运行库}（\texttt{\_internal}），所以体积不会翻倍。\\[4pt]
+\texttt{MathGuard.exe} 其实也支持带参数运行，但没有控制台窗口，
+在 \texttt{cmd} 里看不到输出——所以要批量处理请用
+\texttt{MathGuard-命令行.exe}。
+\end{notebox}
+
+\subsection*{命令行用法}
+\begin{verbatim}
+MathGuard-命令行.exe 论文.tex              单篇检查
+MathGuard-命令行.exe --batch 目录\ -q      整目录批量（快 5-6 倍）
+MathGuard-命令行.exe 论文.tex --lint       额外检查公式末尾标点
+MathGuard-命令行.exe examples\hard.tex     跑一个示例试试
+\end{verbatim}
+
+\section{报告怎么读：四态结论}
+
+每条公式只有四种结论，\textbf{这是本工具最重要的部分}：
+
+\begin{center}
+\begin{tabular}{@{}clp{7.6cm}@{}}
+\toprule
+标记 & 含义 & 你该怎么做\\
+\midrule
+\texttt{[\checkmark{}]} & 已验证通过 & 真的做过一次数值判定，且成立\\
+\rowcolor{red!8}
+\texttt{[$\times$]} & \textbf{验证失败} & 数值关系\textbf{确定}不成立，\textbf{必须修}\\
+[\$\approx\$] & 仅可解析 & 能读懂，但没有可判定的数字关系\\
+[\$-\$] & 无法验证 & 超出能力，已安全跳过\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warnbox}
+\textbf{只有 \texttt{[$\times$]} 是可以断言「错」的。}其余三种都\textbf{不是}「通过」。
+
+看到大量 [\$\approx\$] 不要惊讶——纯符号等式（如 $a^2+b^2=c^2$）、矩阵、
+多重求和本来就没法用数值验证。工具的诚实就在于此：\textbf{不懂就说不懂}。
+\end{warnbox}
+
+\section{能力边界：它\textbf{查不出来}什么}
+
+\begin{longtable}{@{}p{4.2cm}p{10.5cm}@{}}
+\toprule
+类型 & 说明\\
+\midrule
+证明/推导是否正确 & $a^2+b^2$ 写成 $a^2+b^3$ 分不出来——两者都不是可判定的数值关系\\
+定理是否有意义 & 它不懂数学，只做形式校验\\
+符号是否未定义 & 实测命中率 0\%：找到的「只出现一次的单字母」全是 $e$、$H$ 这类正常符号\\
+中英混排空格 & 不同期刊风格差异太大，无统一标准\\
+公式末尾标点 & 默认关闭（实测 259 份文档产生 309 条警告，会淹没真问题）\\
+\bottomrule
+\end{longtable}
+
+\subsection*{关于「公式正确性」的实话}
+你可能会想：作者自己肯定验证过很多遍了，还能查出什么？
+
+\textbf{确实如此。}本工具的价值不在数学内容，而在\textbf{排版层面的笔误}：
+\begin{itemize}
+\item 公式 (7.16) 的分母是空的，PDF 里印成一道空横线——\textbf{编译 0 错误}
+\item 公式 (4.16) 里 \verb|\binom{}{}| 两个参数都空——\textbf{编译 0 错误}
+\item \verb|\binom{}\{\}| 这种残骸，肉眼扫一遍很难发现
+\end{itemize}
+
+\textbf{这些是作者校对时容易漏掉的，因为它们不产生任何编译错误。}
+至于「这个定理对不对」「这个推导有没有跳步」——\textbf{本工具不碰，也碰不了。}
+
+\section{它\textbf{会刻意放过}的写法}
+
+这些在多轮真实论文测试里确认是正常用法，\textbf{不报错}：
+
+\subsection*{数学记号类}
+\begin{itemize}
+\item 勒让德符号 $(5/11)=1$、$(3/7)=-1$
+\item 有限群逆元 $9=5^{-1}$（不是 $1/9$）
+\item 基数记号 $\#\{\alpha\in\mathbb{F}_2: P(\alpha)=0\}$
+\item 上取整 $\lceil\frac{4n}{5}\rceil$
+\item 范数 $\lVert 11\rVert^2$
+\item 上下标装饰 $4^{\langle1\rangle}=10$（$\langle1\rangle$ 是标记，不是指数）
+\item 求值竖线 $t|_{n=0}=1$
+\item 商集 $Z/_{\sim}$、$T=F/{\equiv}$
+\item 阶乘 $6\cdot 3!=36$（\texttt{!=} 不是「不等于」）
+\item 置换 $(123)^{-1}=(132)$
+\item 序理论签名 $\langle W,\le\rangle$、$\{<,c_n:n\ge1\}$
+\item 数理逻辑矛盾式 $0=1$（表示「假」）
+\item 超域 $1\oplus1=\{0,1\}$
+\item 范畴论 $\mathrm{Mor}$、$\setminus$、$\mathcal{W}$
+\end{itemize}
+
+\subsection*{排版写法类}
+\begin{itemize}
+\item 多行公式续行 $\displaystyle\Sigma_4(m)\equiv$（以关系符结尾）
+\item 中文句中的符号代用：题设常数 $=2\times10^{-4}$
+\item 公式末尾的句号 $...=1210.$
+\item TikZ 图标签 \verb|\node ... {$w =$}|
+\item 表格列格式碎片 $>\{\$\}l<\{\$\}$
+\item 空占位 $\{\}=\{\}$
+\item 代码展示环境（verbatim / lstlisting / dispListing / LaTeXdemo）
+\item \verb|\code{...}|、\verb|\verb|...\verb|| 里的字面量
+\end{itemize}
+
+\section{输入格式}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+输入 & 支持 & 说明\\
+\midrule
+\texttt{.tex} 源码 & \$\checkmark\$ & 唯一可靠输入\\
+UTF-8 / GBK / Big5 & \$\checkmark\$ & 自动识别（WinEdt + CJK 老稿件可直接跑）\\
+多文件 \verb|\input| & \$\checkmark\$ & 指向主文件即可，自动递归展开\\
+自定义宏 & \$\checkmark\$ & \verb|\def|/\verb|\newcommand| 自动展开\\
+\textbf{PDF} & \$\times\$ & \textbf{拒绝}——实测提取 0 条公式却报「通过」，最坏的结果\\
+\textbf{.docx} & \$\times\$ & 引用会退化成纯文本\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{数值验证的标准}
+
+\subsection*{什么情况下会做数值判定}
+
+只有当一条公式\textbf{两边都是可计算的数值}时才判定：
+\begin{itemize}
+\item 纯数字：$2+2$, $3\times4$, $2^{10}$, $1/2+1/3$
+\item 白名单函数：$\sqrt{16}$、$\binom{5}{2}$、$5!$、$\log_2 8$
+\item 带符号的等式\textbf{不判定}（$x+1=2+1$ 需要代值）
+\end{itemize}
+
+\subsection*{验证覆盖率取决于你的论文类型}
+\begin{center}
+\begin{tabular}{@{}p{5.5cm}p{9cm}@{}}
+\toprule
+论文类型 & 典型「真正做了判定」的比例\\
+\midrule
+纯计算/数值论文 & \textbf{60--92\%}\\
+工程、物理（大量数值公式） & 40--70\%\\
+\textbf{纯数学理论论文} & \textbf{接近 0\%}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这不是工具偷懒。纯数学论文里的公式 99\% 是
+$\Gamma_0/(1-\Gamma_0)=z(s+z)/(1-z^2)$ 这种符号关系，
+\textbf{不代入具体数值就无法判定对错}。
+
+\begin{notebox}
+所以：对纯理论论文，请把注意力放在\textbf{结构检查}上
+（空参数、环境配对、引用断裂）——那部分的覆盖率是 \textbf{100\%}。
+\end{notebox}
+
+\section{退出码（写脚本时用）}
+\begin{center}
+\begin{tabular}{@{}cl@{}}
+\toprule
+码 & 含义\\
+\midrule
+0 & 干净\\
+1 & 仅结构问题\\
+\textbf{3} & \textbf{存在验证失败}（数字关系确定不成立）\\
+2 & 用法错误\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{隐私}
+\begin{itemize}
+\item \textbf{完全离线}：不发起任何网络请求
+\item \textbf{只读}：不修改你的 \texttt{.tex} 文件
+\item \textbf{无遥测}：不收集任何数据
+\item 唯一写入：在论文旁边生成一份 \texttt{math\_guard\_report.txt}
+\end{itemize}
+
+\section{已知误判（诚实清单）}
+\begin{center}
+\begin{tabular}{@{}p{5.5cm}p{2.2cm}p{6.5cm}@{}}
+\toprule
+情形 & 现状 & 原因\\
+\midrule
+\verb|y \ge |（漏写右操作数） & 跳过 & 与 \verb|$u \neq$ {\rm R}$_0$| 文本上无法区分\\
+\verb|q <|（多稿拼接残留） & 报错 & 确实是笔误，但工具无法替你补内容\\
+$\phi=-2/3=1/3$（模 $\mathbb{Z}$ 相等） & 报错 & 需要读懂「modulo $\mathbb{Z}$」的语境\\
+变量等式 $x+1=2+1$ & 仅可解析 & 不代值不判定\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{遇到误报：}把那一行 LaTeX 贴到 Issues，或直接发给作者。每一个误报都值得修。
+
+\section*{附：文件清单}
+\begin{verbatim}
+MathGuard/
+├── MathGuard.exe              图形界面（双击这个）
+├── MathGuard-命令行.exe        命令行版（批处理用）
+├── 使用说明.pdf           本文件
+├── examples/             示例文件
+│   ├── easy.tex          入门：几处典型错误
+│   ├── medium.tex        进阶：各种边界写法
+│   └── hard.tex          挑战：真实论文片段（复杂宏、多文件）
+└── _internal/            运行库（勿删）
+\end{verbatim}
+
+\end{document}

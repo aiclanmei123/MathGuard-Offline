@@ -1,0 +1,28 @@
+% ============================================================
+%  example_easy.tex  ——  入门示例：5 处明显错误
+%  用法：math_guard.exe example_easy.tex
+%  预期：退出码 3，报出下面标注的 5 处问题
+% ============================================================
+\documentclass{article}
+\begin{document}
+
+\section{First}\label{sec:first}
+
+% 错误 1：分母为空（编译不报错，PDF 里印成一道空横线）
+\[ \frac{a+b}{} = 1 \]
+
+% 错误 2：二项式系数两个参数都空
+\[ \binom{}{} = 0 \]
+
+% 错误 3：数值算错（4 ≠ 5）
+\[ 2+2=5 \]
+
+% 错误 4：分数加法算错（应为 5/6）
+\[ \frac{1}{2}+\frac{1}{3}=\frac{2}{5} \]
+
+% 错误 5：幂算错（1000 ≠ 100）
+\[ 10^{3}=100 \]
+
+This section is referenced by nobody else.
+
+\end{document}
