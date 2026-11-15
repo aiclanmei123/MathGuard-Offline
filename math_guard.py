@@ -2983,6 +2983,18 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
         #    放在这里是因为「两侧都有操作数」的式子根本进不了
         #    「缺操作数」分支，之前的规则就是因此失效的（实测）。
         _raw0 = item.latex
+        # 0) 置换/群元素记法：
+        #      (123)^{-1}=(132)        轮换的逆
+        #      (1\ 3\ 4)(2\ 3\ 4)=(1\ 3)(2\ 4)   置换乘法
+        #    括号里是**数字串构成的置换**，不是数值乘法。
+        #    实证（arXiv 2610.29539、2610.20024）
+        #    判据：等号两侧都由「含 ≥2 个数字的括号」与 \ 空格构成。
+        if re.search(r"\(\s*[0-9]{2,}\s*\)", _raw0) or \
+                re.fullmatch(r"[\s\\()0-9=^\{}\-]+", _raw0) and \
+                len(re.findall(r"\([\s\\0-9]{4,}\)", _raw0)) >= 2:
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="置换/群元素记法（括号里是数字串），不是数值乘除",
+                               line=item.line, kind=item.kind)
         # a) 有限群里的**逆元**：9=5^{-1}、s=6=2^{-1}
         #    实证（On_Distinct_Powers L619）：
         #      "the only ratios of weight 2 are 5 and 9=5^{-1}"
@@ -3030,6 +3042,165 @@ def _verify_with_sympy_inner(item: MathItem) -> CheckDetail:
                         _raw0.strip()) and not re.search(r"\}", _raw0):
             return CheckDetail(latex=item.latex, status="skip",
                                reason="变量 + 关系符的标记写法，非完整算式",
+                               line=item.line, kind=item.kind)
+
+        # h) 关系符被当作**符号名**放进括号里
+        #    这是序理论 / 数理逻辑 / 模型论的常见写法：
+        #      F=\langle W,\leq\rangle          —— 关系结构 ⟨W,≤⟩
+        #      L=\{<,c_n:n\geq1\}               —— 语言签名 {<, c_n ...}
+        #      L_0:=\langle\leq\rangle
+        #      \{<\}\kappa
+        #      {=^{++}}\not\leq_B{=^+}          —— 等价类记号
+        #      L_F=\{<,0,-,+\}\cup\{\lambda\cdot\}_{\lambda\in F}
+        #    实证：arXiv 2610.38871 / 2610.24422 / 2610.24683 /
+        #          2610.26335 / 2610.40440 / 2610.34900（第三轮采集）
+        #    判据：公式里存在 ⟨…⟩ 或 {…}，且括号内**包含关系符作为独立项**
+        #         （即逗号分隔的列表里有一项就是关系符本身）。
+        #    ⚠ 不能要求「整个括号内只有符号」：⟨W,≤⟩ 里有变量 W，
+        #      {<,c_n:n≥1} 里有 c_n，它们都仍是签名。
+        _inside = re.findall(r"\\langle([^{}]*?)\\rangle", _raw0)
+        _inside += re.findall(r"\\\{([^{}]*?)\\\}", _raw0)
+        _REL_TOK = (r"(?:<=|>=|<|>|=|\\le|\\ge|\\leq|\\geq|\\neq|\\ne|\\sim"
+                    r"|\\equiv|\\preceq|\\prec|\\sqsubseteq|\\subseteq|\\subset)")
+        for _seg in _inside:
+            # 按逗号切项，看是否有一项"就是关系符"
+            for _item_ in re.split(r",|\\colon|:", _seg):
+                if re.fullmatch(r"\s*" + _REL_TOK + r"\s*", _item_):
+                    return CheckDetail(latex=item.latex, status="skip",
+                                       reason="关系符作为符号项出现在 ⟨…⟩/{…} 列表中（签名/序结构），非数值断言",
+                                       line=item.line, kind=item.kind)
+        # 等价类记号 =^{++} / =^+
+        if re.search(r"=\s*\^\s*\{", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="等价类/上标关系记号（=^{...}），非数值断言",
+                               line=item.line, kind=item.kind)
+        # i) 批处理暴露的 6 类（第三轮 4562 篇采集）
+        #   ① 基数比较记号 {<}\kappa / {<}\omega_1
+        #      "takes ${<}\kappa$-many values"（2610.34900 L215）
+        if re.search(r"\{\s*(<|>|\\le|\\ge|\\leq|\\geq)\s*\}", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="基数比较记号 {<}κ，非数值断言",
+                               line=item.line, kind=item.kind)
+        #   ② 带撇的变量：1'=2 / 2'=1（2610.37532 L1345）
+        #      撇号是变量名的一部分，不是导数之外的数值
+        if re.search(r"[A-Za-z0-9]\s*'\s*[=<>]", _raw0) or \
+                re.search(r"=\s*[A-Za-z0-9]\s*'", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="变量名含撇号（如 1'），与普通数字不是同一记号",
+                               line=item.line, kind=item.kind)
+        #   ③ 下标定义的函数取值：2_0=1 且 2_k 是"超指数函数"（2610.36982）
+        #      判据：同一篇里出现过 <数字>_k 的定义式，或形式为 x_0 = 常数
+        if re.fullmatch(r"\s*[A-Za-z0-9]+\s*_\s*\{?\s*[A-Za-z0-9]\s*\}?\s*=\s*[0-9.]+\s*",
+                        _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="带下标的记号取值（如 2_0=1），通常是自定义记号",
+                               line=item.line, kind=item.kind)
+        #   ④ 超运算结果是集合：1\oplus 1=\{0,1\}（2610.30762 L430）
+        if re.search(r"\\oplus|\\otimes", _raw0) and re.search(r"\\\{", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="超域/超运算（\\oplus 的结果是集合），非普通数值运算",
+                               line=item.line, kind=item.kind)
+        #   ⑤ 序型/区间记号：2=\{0\leq 1\}（2610.29771）
+        #      ⚠ 此时 \leq 还是命令形式，正则要同时匹配符号和命令名
+        if re.search(r"=\s*\\\{[^{}]*(<|>|\\le|\\ge|\\leq|\\geq)[^{}]*\\\}", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="序型/区间记号（数字 = {a≤b}），非数值等式",
+                               line=item.line, kind=item.kind)
+        #   ⑥ 范畴论的对象/态射链：0=1=A^0\to A^X（2610.23278）
+        if re.search(r"\\to|\\rightarrow|\\mapsto", _raw0) and \
+                re.search(r"\^\s*\{?\s*[A-Za-z0-9]\s*\}?", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="范畴/逻辑里的对象链（含 \\to 与上标），非数值断言",
+                               line=item.line, kind=item.kind)
+        #   ⑦ 数理逻辑里的**矛盾式**记号：0 = 1 表示"假"
+        #      实证（2610.34548 app-curry.tex L21-52）：
+        #        "$\emptyset \ent 0 = 1$"  "$\ent \neg(0 = 1)$"
+        #        "the closed term $0 = 1$ is unchanged"
+        #      这是 Curry 悖论论文里表示"假/不一致"的固定写法，
+        #      不是笔误。判据：整条公式就是 0=1（或带否定）。
+        if re.fullmatch(r"\s*(\\neg\s*)?\(?\s*0\s*=\s*1\s*\)?\s*", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="数理逻辑中的矛盾式记号（0=1 表示假），非笔误",
+                               line=item.line, kind=item.kind)
+        #   ⑧ 公式提取残片：以 \}  开头（前一段被切断）
+        if re.match(r"\s*\\\}", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="公式提取残片（以右花括号开头），非完整公式",
+                               line=item.line, kind=item.kind)
+        #   ⑨ 右侧为空、内容在数学模式外：$W =$ text、$c :=$ text
+        #      实证（3000 抽样）：W = / x = / K= / R= / T= / c := / q = \{
+        #      这些是"公式只写了左半边"，右半边是普通文本或分裂到下一段。
+        #      判据：去掉尾部空白后，以关系符/赋值号结尾。
+        _t = _raw0.strip()
+        if re.search(r"(=|:=|\\coloneqq|\\le|\\ge|\\leq|\\geq|<|>|\\\{)\s*$", _t) \
+                and not re.search(r"[0-9]+\s*$", _t):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="关系符右侧为空（右操作数在数学模式外），无法判定",
+                               line=item.line, kind=item.kind)
+        #   ⑨b 以关系符结尾且**整体较短**：q = \{ / W = / \approx 0.31
+        #      实证（3000 抽样）：q = \{ 是"q 等于某个集合"的开头，
+        #      集合内容在下一段；\ \approx 0.31 的左边被切断。
+        #      判据：以关系符开头或结尾，且没有成对的操作数。
+        #      ⚠ 先剥掉行首的 `\ `（LaTeX 非断行空格）再判断。
+        _t2 = re.sub(r"^(?:\\[ ,;:!]|\s)+", "", _t)
+        if re.match(r"\\(approx|simeq|sim|cong)\b", _t2):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="只有右侧的近似记号，左侧在数学模式外",
+                               line=item.line, kind=item.kind)
+        #   ⑩ 微分算子：=\dd/\dd\xi、'=\dd/\dd\xi
+        if re.search(r"\\dd\b|\\mathrm\{d\}|\\partial", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="含微分算子记号，非数值断言",
+                               line=item.line, kind=item.kind)
+        #   ⑪ 取整记号 [63/2]=31、F_0=\{\leq j_0\}
+        if re.search(r"\[[0-9][^\[\]]*\]\s*=", _raw0) \
+                or re.search(r"=\s*\\left\\\{|=\s*\\\{", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="取整/集合记号（[...] 或 \\{...\\}），非数值等式",
+                               line=item.line, kind=item.kind)
+        #   ⑫ 只有右侧的近似：\approx 0.31
+        if re.match(r"\s*\\(approx|simeq|sim|cong)\b", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="只有右侧的近似记号，左侧在数学模式外",
+                               line=item.line, kind=item.kind)
+        #   ⑬ 范畴论/数学结构记号：\mathrm{Mor}_{...}
+        if re.search(r"\\mathrm\{(Mor|Hom|Ob|End|Aut|id)\}", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="范畴论记号（Mor/Hom/Ob 等），非数值断言",
+                               line=item.line, kind=item.kind)
+        #   ⑭ 0^0=0：0^0 在组合数学里常按 1 约定，作者可能按 0 处理，无法判定
+        if re.search(r"0\s*\^\s*\{?\s*0\s*\}?", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="含 0^0（约定值依上下文而定），无法判定",
+                               line=item.line, kind=item.kind)
+        #   ⑮ 开头是运算符、没有左边：+1=1+1=2（条目编号/页码累加）
+        if re.match(r"\s*[+\-]\s*[0-9]", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="以运算符开头的片段（左操作数被切断），无法判定",
+                               line=item.line, kind=item.kind)
+        #   ⑯ 只含变量/下标的等式右侧（\dim_j=2j+1=2 里的 2j+1）
+        #      判据：等号右侧含裸变量字母与数字混排，且整体只有一行
+        if re.fullmatch(r"[\s0-9A-Za-z_\\{}().+\-*/=]*", _raw0) and \
+                re.search(r"[0-9]\s*[A-Za-z]\s*[+\-]", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="含变量与数字混排的表达式，需代值才能判定",
+                               line=item.line, kind=item.kind)
+        #   ⑰ 范畴论/高阶代数记号（3000 抽样发现）：
+        #      {^{\mathrm{cop}}(-)}^\mathrm{cop}:=(-)^\mathrm{cop}\circ...
+        #      \{ {\mathcal W}' \}\times_{{\mathrm{Cmon}}(...)}
+        #      \{<k\} \setminus \mathcal{M}_k
+        #      这些是函子/算子/集合差的记号，等号/≃ 是**定义**而非数值断言。
+        #      判据：含 \mathrm{...} 或 \mathcal{...} 或 \setminus ，
+        #            且同时含 := / \simeq / \circ / \times_ 。
+        if re.search(r"\\mathrm\{|\\mathcal\{|\\setminus|\\widehat\{", _raw0) and \
+                re.search(r":=|\\simeq|\\cong|\\circ|\\times_|\\to\b", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="范畴论/高阶代数记号（函子、集合差、定义式），非数值断言",
+                               line=item.line, kind=item.kind)
+        # 纯集合差：\{<k\}\setminus M_k
+        if re.search(r"\\setminus|\\smallsetminus", _raw0):
+            return CheckDetail(latex=item.latex, status="skip",
+                               reason="集合差记号（\\setminus），非数值运算",
                                line=item.line, kind=item.kind)
 
         try:
